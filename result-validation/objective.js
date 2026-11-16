@@ -15,7 +15,7 @@ import { SCORE_SCALE } from './stacking.js';
 import { LENGTH, TICKS_PER_GRAM, WEIGHT, perUnit, toTicks } from './units.js';
 
 /** `floor(volume * weight ticks per unit / (length ticks per unit ^ 3 * divisor))`. */
-function dimensionalWeight(size, divisor, lengthUnit, weightUnit) {
+export function dimensionalWeight(size, divisor, lengthUnit, weightUnit) {
   const length = perUnit(LENGTH, lengthUnit);
   const weight = perUnit(WEIGHT, weightUnit);
   return floorDiv(size[0] * size[1] * size[2] * weight, length ** 3n * divisor);

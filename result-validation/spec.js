@@ -190,15 +190,38 @@ function frameAndDeck(declared, limit, unit) {
     Object.freeze([overhangX, overhangY, declared[0], declared[1]])];
 }
 
-/** A gusseted bag's side gusset depth in ticks, else 0n. */
-function sideGusset(boundary, unit) {
+/** A gusseted bag's side or bottom gusset depth in ticks, else 0n. */
+function gusset(boundary, name, unit) {
   if (boundary === null) return 0n;
-  const depth = getNull(boundary, 'side_gusset_depth');
+  const depth = getNull(boundary, name);
   return depth === null ? 0n : toTicks(depth, unit, LENGTH);
 }
 
+/**
+ * How a bag's package of extents `(a, b, c)` breaks a loop of film, or null.
+ *
+ * Lying flat on an `L x W` bag: `2(a + c) <= 2L + K` and `b + c <= W + G`. Standing in its
+ * `W x H x L` frame: `2(b + c) <= 2L + K` and `a + b <= W + G` (1.10). `G`
+ * and `K` are the side and bottom gussets, 0n where none is declared.
+ */
+export function girthBreach(spec, a, b, c) {
+  const [length, width] = spec.standing ? [spec.inner[2], spec.inner[0]] : [spec.inner[0], spec.inner[1]];
+  const [along, across] = spec.standing ? [b + c, a + b] : [a + c, b + c];
+  if (2n * along <= 2n * length + spec.bottomGusset && across <= width + spec.sideGusset) return null;
+  const sums = spec.standing
+    ? `b + c = ${b + c}, a + b = ${a + b}, standing, length ${length}, width ${width}`
+    : `a + c = ${a + c}, b + c = ${b + c}, flat size ${length} x ${width}`;
+  return sums + (spec.sideGusset ? `, side gusset ${spec.sideGusset}` : '')
+    + (spec.bottomGusset ? `, bottom gusset ${spec.bottomGusset}` : '');
+}
+
 function parseContainer(raw, unit) {
-  const [inner, deck] = frameAndDeck(dimensions(at(raw, 'inner_dimensions'), unit), getNull(raw, 'pallet_overhang_limit'), unit);
+  const boundary = getNull(raw, 'deformable_boundary');
+  const standing = boundary !== null && getNull(boundary, 'orientation') === 'standing';
+  const declared = dimensions(at(raw, 'inner_dimensions'), unit);
+  // A standing bag's placements are in its `W x H x L` frame, which `inner` then is.
+  const [inner, deck] = frameAndDeck(standing ? [declared[1], declared[2], declared[0]] : declared,
+    getNull(raw, 'pallet_overhang_limit'), unit);
   return Object.freeze({
     id: at(raw, 'id'),
     inner,
@@ -216,10 +239,15 @@ function parseContainer(raw, unit) {
     axles: optional(raw, 'axles', (value) => axles(value, unit)),
     maxStackDensity: optional(raw, 'max_stack_density', weightTicks),
     rateTable: getNull(raw, 'rate_table'),
-    flatBag: getNull(raw, 'deformable_boundary') !== null,
+    flatBag: boundary !== null,
     // 1.10: a gusseted bag's side gusset depth G in ticks, widening the width girth to
     // b + c <= W + G; 0n for a flat bag and every rigid container.
-    sideGusset: sideGusset(getNull(raw, 'deformable_boundary'), unit),
+    sideGusset: gusset(boundary, 'side_gusset_depth', unit),
+    // Its bottom gusset depth K, lengthening the length girth to 2(a + c) <= 2L + K;
+    // 0n where none is declared.
+    bottomGusset: gusset(boundary, 'bottom_gusset_depth', unit),
+    // A bag standing on its bottom gusset, whose `inner` is then `W x H x L`.
+    standing,
     reportsAchievedExtent: getNull(raw, 'deformable_boundary') !== null || getNull(raw, 'made_to_measure') !== null
       || deck !== null,
     madeToMeasure: optional(raw, 'made_to_measure', (machine) => parseMachine(machine, unit)),

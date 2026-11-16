@@ -25,17 +25,6 @@ const supportPpm=(ratio)=>ratio>0?Math.max(1,scaledRatio(ratio)):0;
 const MIN_CANDIDATE_POINTS=16;
 const hasOwn=(value,key)=>Object.prototype.hasOwnProperty.call(value,key);
 const isObject=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
-function cloneValue(value){
-  if(Array.isArray(value))return value.map(cloneValue);
-  // An item's accepted stacking groups are a Set of strings; copied, not flattened.
-  if(value instanceof Set)return new Set(value);
-  if(value!==null&&typeof value==='object'){
-    const copy={};
-    for(const [key,entry] of Object.entries(value))copy[key]=cloneValue(entry);
-    return copy
-  }
-  return value
-}
 const UNSUPPORTED={
   // Top-level scope: a block describing the whole request rather than one item or
   // container, which none of the per-entry loops below would ever see.
@@ -106,7 +95,8 @@ const billedGrams=ticks=>Number((BigInt(ticks)+BigInt(WT.g)-1n)/BigInt(WT.g));
 function chargeMinor(table,grams){
   for(let index=0;index<table.brackets.length;index++)if(grams<=table.brackets[index]){
     const base=Math.max(table.prices[index],table.minimum);
-    return base+ceilDiv(base*table.fuel,1000)
+    // base*fuel can pass 2^53 while the landed charge (held to 2^53-1 at admission) does not.
+    return base+Number((BigInt(base)*BigInt(table.fuel)+999n)/1000n)
   }
   return null
 }
@@ -115,10 +105,13 @@ function chargeMinor(table,grams){
 // instead. Unlike a missing rate card -- rejected at admission, since that is a static
 // property of the request -- this depends on how the search happened to fill the box,
 // so it must lose a candidate rather than abort the run.
-const UNPRICEABLE=Number.MAX_SAFE_INTEGER;
+// Infinity, not a safe integer: the admission ceiling lets a real charge be exactly 2^53-1.
+const UNPRICEABLE=Infinity;
 // One wording for the refusal wherever it fires (outermost solve frame, rebalancing),
 // so the four engines stay literally comparable.
 const unpriceableRefusal=({id,grams,bound})=>new RangeError(`container ${JSON.stringify(id)} bills at ${grams} g, above its rate table's last bracket (${bound} g); the shipment has no published price`);
+// An unpriceable total is still reported as the largest safe integer, as every engine does.
+const reportedLanded=total=>total===UNPRICEABLE?Number.MAX_SAFE_INTEGER:total;
 const addLanded=(total,template,billedTicks)=>{
   if(total===UNPRICEABLE)return total;
   const charge=template.rate==null?null:chargeMinor(template.rate,billedGrams(billedTicks));
@@ -350,8 +343,26 @@ function fixedSetIssue(groups,req,clear){
 function bagExtent(placements){let a=0,b=0,c=0;
   for(const p of placements){a=Math.max(a,p.x+p.ed[0]);b=Math.max(b,p.y+p.ed[1]);c=Math.max(c,p.z+p.ed[2])}
   return [a,b,c]}
-// 1.10: a gusseted bag's side gusset G widens the width girth to b + c <= W + G; G = 0 is the flat bag.
-function bagAdmits(tmpl,placements){const [a,b,c]=bagExtent(placements);return a+c<=tmpl.d[0]&&b+c<=tmpl.d[1]+tmpl.gusset}
+// A bag's two loops of film round its package (1.10 side gusset G, bottom
+// gusset K, 0 where none is declared): lying flat on `L x W`, 2(a + c) <= 2L + K along and
+// b + c <= W + G across; standing in its `W x H x L` frame, 2(b + c) <= 2L + K and a + b <= W + G.
+// Each loop is held as the axis its side bounds (`a <= L` lying flat, `c <= L` standing, by the
+// rigid check that always runs first), the axis added to it, and that side. Null for a rigid
+// container. O(1).
+function bagGirth(boundary,declared,length){if(boundary==null)return null;
+  const standing=boundary.orientation==='standing';
+  return Object.freeze({standing,length:declared[0],width:declared[1],
+    side:boundary.side_gusset_depth==null?0:length(boundary.side_gusset_depth),
+    bottom:boundary.bottom_gusset_depth==null?0:length(boundary.bottom_gusset_depth),
+    along:standing?[2,1]:[0,2],across:standing?[0,1]:[1,2]})}
+// The `W x H x L` frame a bag declared `L x W x H` stands in, and back.
+const standingFrame=declared=>[declared[1],declared[2],declared[0]];
+const declaredFrame=tmpl=>tmpl.girth?.standing?[tmpl.d[2],tmpl.d[0],tmpl.d[1]]:declaredInner(tmpl.d,tmpl.deck);
+// Differences from the bounded side, not plain sums: every term stays a safe integer however
+// long the sides, so 2(a + c) <= 2L + K reads exactly as 2((a - L) + c) <= K.
+function girthAdmits(girth,extent){const [i,j]=girth.along,[p,q]=girth.across;
+  return 2*((extent[i]-girth.length)+extent[j])<=girth.bottom&&(extent[p]-girth.width)+extent[q]<=girth.side}
+function bagAdmits(tmpl,placements){return girthAdmits(tmpl.girth,bagExtent(placements))}
 function compatibilityIssue(item,others,tmpl){
   if(item.tags.length||item.incompatible.length)for(const other of others)
     if(item.incompatible.some(tag=>other.item.tags.includes(tag))||other.item.incompatible.some(tag=>item.tags.includes(tag)))
@@ -411,9 +422,20 @@ function routeStuck(placements,tmpl,clear){
       const chosen=Math.min(...removable);present.delete(chosen);due=due.filter(k=>k!==chosen)}}
   return null
 }
-function rat(s){s=String(s).trim();if(s.includes(' ')){const [w,f]=s.split(/\s+/,2),[n,d]=f.split('/').map(BigInt),wb=BigInt(w),sg=s.startsWith('-')?-1n:1n,mag=(wb<0n?-wb:wb)*d+n;return [sg*mag,d]}if(s.includes('/')){const[n,d]=s.split('/').map(BigInt);return[n,d]}if(s.includes('.')){const neg=s.startsWith('-'),[a,b]=s.replace(/^[-+]/,'').split('.');const d=10n**BigInt(b.length),n=BigInt(a)*d+BigInt(b);return[neg?-n:n,d]}return[BigInt(s),1n]}
+// K1: the measure grammar of Python's `_fraction`, the reference: an optional sign and ASCII digits, a `.` with digits on both sides (at most 18 after it), `n/d`, or a mixed `w n/d`; nothing else.
+// The classes spell Python's whitespace by hand, because JavaScript's `\s` and `trim` differ from it.
+const PY_SPACE='\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000',ASCII_SPACE='[ \\t\\n\\r\\f\\v]';
+const MIXED_MEASURE=new RegExp(`^([+-]?[0-9]+)${ASCII_SPACE}+([0-9]+)${ASCII_SPACE}*/${ASCII_SPACE}*([0-9]+)$`),FRACTION_MEASURE=new RegExp(`^([+-]?[0-9]+)${ASCII_SPACE}*/${ASCII_SPACE}*([0-9]+)$`),DECIMAL_MEASURE=/^([+-]?)([0-9]+)(?:\.([0-9]+))?$/;
+const MEASURE_SUFFIX=new RegExp(`^([^\\n]+?)[${PY_SPACE}]*(inches|ticks|inch|lbs|tick|mm|cm|ft|in|mg|kg|oz|lb|g|m)$`,'i'),PY_TRIM=new RegExp(`^[${PY_SPACE}]+|[${PY_SPACE}]+$`,'g');
+function rat(s){if(typeof s==='number'&&!Number.isInteger(s))throw new RangeError('a fractional number is not a measure');
+  const text=String(s).replace(PY_TRIM,'').replace(/ /g,' '),mixed=MIXED_MEASURE.exec(text);
+  if(mixed){const d=BigInt(mixed[3]),whole=BigInt(mixed[1]),magnitude=(whole<0n?-whole:whole)*d+BigInt(mixed[2]);return [text.startsWith('-')?-magnitude:magnitude,d]}
+  const simple=FRACTION_MEASURE.exec(text);if(simple)return [BigInt(simple[1]),BigInt(simple[2])];
+  const decimal=DECIMAL_MEASURE.exec(text);if(decimal===null)throw new RangeError(`invalid decimal or fraction: ${text}`);
+  const places=decimal[3]??'';if(places.length>18)throw new RangeError('decimal has more fractional digits than a tick can distinguish');
+  const scale=10n**BigInt(places.length),magnitude=BigInt(decimal[2])*scale+BigInt(places===''?'0':places);return [decimal[1]==='-'?-magnitude:magnitude,scale]}
 function round(n,d){const sg=n<0n?-1n:1n,a=n<0n?-n:n,q=a/d,r=a%d;const z=r*2n<d?q:r*2n>d?q+1n:q%2n===0n?q:q+1n;return sg*z}
-function scalar(v,def,table){let raw=v,unit=def;if(v&&typeof v==='object'){raw=v.value;unit=v.unit??def}else if(typeof v==='string'){const m=v.trim().match(/^(.+?)\s*(millimeters|millimeter|inches|ticks|inch|lbs|tick|mm|cm|ft|in|mg|kg|oz|lb|g|m)$/i);if(m){raw=m[1];unit=m[2]}}const[n,d]=rat(raw),exact=round(n*BigInt(table[unit.trim().toLowerCase()]),d),ticks=table===WT?exact:Number(exact);if(ticks<0)throw new RangeError(`${table===WT?'weight':'length'} cannot be negative`);return ticks}
+function scalar(v,def,table){let raw=v,unit=def;if(v&&typeof v==='object'){raw=v.value;unit=v.unit??def}else if(typeof v==='string'){const m=MEASURE_SUFFIX.exec(v.replace(PY_TRIM,''));if(m){raw=m[1];unit=m[2]}}const[n,d]=rat(raw),exact=round(n*BigInt(table[unit.trim().toLowerCase()]),d),ticks=table===WT?exact:Number(exact);if(ticks<0)throw new RangeError(`${table===WT?'weight':'length'} cannot be negative`);return ticks}
 // With no `output.length_unit`, the request's own `units.length` spelt as the schema's
 // output code ("Inches" is `in`); a unit no output code names, the internal tick, gives `mm`.
 /** A length measure in `unit`, and a weight measure in grams, as exact ticks: the request
@@ -678,6 +700,11 @@ export class BoundOverflowError extends Error{
     this.name='BoundOverflowError';
   }
 }
+/** A billed objective's inventory cannot carry, at any price it lists, a packing that attains
+ *  `L0`; no answer is compared against a bound then, so none is stated. */
+class BoundWithheld extends Error{
+  constructor(reason){super(reason);this.name='BoundWithheld'}
+}
 function boundGuard(total,quantity){
   if(total>MAX_BOUND_SUM)throw new BoundOverflowError(quantity);
   return total;
@@ -838,7 +865,11 @@ function objectiveBounds(instances,containers){
  *  ranks by. Any other objective has no bound. */
 const BOUND_ORDERS=new Map([['default',[0,1,2,3,4]],['lowest_cost',[0,2,1,3,4]],
   ['maximum_value',[0,'value_forgone',1,2,3]],['open_dimension_height',[0,'achieved_height',1,2,3]],
-  ['maximum_volume',['unpacked_volume_ppm',0,1,2,3]]]);
+  ['maximum_volume',['unpacked_volume_ppm',0,1,2,3]],
+  ['shipping_cost',[0,'billed_weight',1,3,4]],['lowest_landed_cost',[0,'landed_charge',1,3,4]]]);
+/** The objectives whose own key is what a carrier bills, which needs the configuration's
+ *  dimensional-weight divisor and units as well as the request. */
+const BILLED_OBJECTIVES=new Set(['shipping_cost','lowest_landed_cost']);
 /** The sum of the `count` smallest values of unsorted `[value, count]` runs, without sorting
  *  them: a max-heap holds only the runs the `count` smallest can still reach, and the run on
  *  top contributes just the part of it they need. The bound already paid for its only sorts
@@ -867,11 +898,14 @@ function runSmallestUnsorted(pairs,count){
  *  drops both volume terms. No term sorts: the volume runs are the ones the five bounds sorted,
  *  and the values are selected, so the bound stays `O(t log t + c log c)`; `BigInt` until
  *  `boundOutput`. */
-function objectiveTerm(name,volumes,values,shrinks,containers,unpacked){
+function objectiveTerm(name,volumes,weights,values,shrinks,containers,[unpacked,opened]){
   if(name==='value_forgone')return runSmallestUnsorted(values,unpacked);
+  const placed=runCount(volumes)-unpacked;
+  if(name==='billed_weight')return billedWeightBound(weights,containers,placed,opened);
+  if(name==='landed_charge')return landedChargeBound(weights,volumes,shrinks,containers,placed,opened);
   if(shrinks)return 0n;
   if(name==='achieved_height'){
-    const placed=runCount(volumes)-unpacked,widest=bigMax(containers.map(c=>c.baseArea));
+    const widest=bigMax(containers.map(c=>c.baseArea));
     return placed>0n&&widest>0n?boundCeilDiv(runSmallest(volumes,placed),widest):0n;
   }
   const requested=volumes.reduce((total,[value,count])=>total+value*count,0n),capacity=boundCapacity(containers,c=>c.usable);
@@ -884,17 +918,144 @@ function objectiveTerm(name,volumes,values,shrinks,containers,unpacked){
 function objectiveVector(order,volumes,weights,values,shrinks,containers){
   const vector=objectiveBoundsFromRuns(volumes,weights,shrinks,containers);
   return order.map(position=>typeof position==='number'?vector[position]
-    :boundOutput(objectiveTerm(position,volumes,values,shrinks,containers,BigInt(vector[0])),position));
+    :boundOutput(objectiveTerm(position,volumes,weights,values,shrinks,containers,[BigInt(vector[0]),BigInt(vector[1])]),position));
+}
+/** What a carrier bills an opened container of this type at the least, `max(tare, dimensional)`
+ *  in weight ticks: it is billed `max(tare + payload, dimensional)` whatever it carries. */
+const billingFloor=c=>c.tare>c.dimensional?c.tare:c.dimensional;
+/** The sum of the `count` smallest of `{value repeated quantity}` from `[value, quantity]`
+ *  pairs, or null when the inventory holds fewer. Sorting the types and taking
+ *  `min(quantity, still needed)` of each is `L2`'s rule, `O(c log c)`, without the multiset. */
+function smallestFromInventory(pairs,count){
+  let total=0n,needed=count;
+  for(const [value,quantity] of [...pairs].sort((a,b)=>bigAscending(a[0],b[0]))){
+    if(needed<=0n)break;
+    const taken=quantity===null||quantity>needed?needed:quantity;
+    total+=value*taken;needed-=taken;
+  }
+  return needed>0n?null:total;
+}
+/** `shipping_cost`'s second key, summed billed weight in ticks.
+ *
+ *  A packing that leaves exactly `L0` behind opens at least `opened` containers and carries at
+ *  least the `placed` lightest instances. Each opened container is billed at least its floor
+ *  and at least its tare plus what it carries, and a sum of maxima is at least either sum on
+ *  its own, so the two are taken over different types. Every term is non-negative, so opening
+ *  more only adds. `O(t + c log c)`. */
+function billedWeightBound(weights,containers,placed,opened){
+  if(opened===0n)return 0n;
+  const floors=smallestFromInventory(containers.map(c=>[billingFloor(c),c.quantity]),opened);
+  const tares=smallestFromInventory(containers.map(c=>[c.tare,c.quantity]),opened);
+  if(floors===null||tares===null)throw new BoundWithheld('the inventory holds fewer containers than must be opened');
+  const carried=tares+runSmallest(weights,placed);
+  return floors>carried?floors:carried;
+}
+/** `lowest_landed_cost`'s second key, the summed carrier charge in minor units.
+ *
+ *  Every opened container is billed in exactly one bracket and pays its charge. A container in
+ *  bracket `[bound, charge]` weighs at most `bound`, so it is reachable only when its floor is
+ *  within it, carries at most `bound - tare` of payload (and its `max_payload`), and at most as
+ *  many instances as the lightest-first count under that payload, its usable volume and
+ *  `max_items`. Three relaxations of that assignment hold and the largest is the bound: the
+ *  cheapest reachable charge per container over `opened` containers; the least cost covering
+ *  the placed weight; the least cost covering the placed count. Prices need not rise with
+ *  weight, which is why a bracket is chosen rather than read off the floor. A type no bracket
+ *  prices offers nothing: a packing that opens one is refused, never returned.
+ *  `O(t + c b log t + c b log(c b))` for `t` runs and `b` brackets per type. */
+function landedChargeBound(weights,volumes,shrinks,containers,placed,opened){
+  if(opened===0n||placed===0n)return 0n;
+  const payloadPrefix=runPrefix(weights),volumePrefix=shrinks?null:runPrefix(volumes);
+  const cheapest=[],offers=[];
+  for(const c of containers){
+    const floor=billingFloor(c),reachable=c.brackets.filter(([bound,charge])=>charge!==null&&floor<=bound);
+    if(!reachable.length)continue;
+    cheapest.push([reachable.reduce((least,[,charge])=>charge<least?charge:least,reachable[0][1]),c.quantity]);
+    const roomy=volumePrefix===null?null:prefixFit(volumePrefix,c.usable);
+    for(const [bound,charge] of reachable){
+      const carried=c.payload!==null&&c.payload<bound-c.tare?c.payload:bound-c.tare;
+      let count=prefixFit(payloadPrefix,carried);
+      if(roomy!==null&&roomy<count)count=roomy;
+      if(c.maxItems!==null&&c.maxItems<count)count=c.maxItems;
+      offers.push([charge,carried,count,c.quantity]);
+    }
+  }
+  const byCount=smallestFromInventory(cheapest,opened);
+  const byWeight=fractionalCover(offers.map(([charge,carried,,quantity])=>[charge,carried,quantity]),runSmallest(weights,placed));
+  const byItems=fractionalCover(offers.map(([charge,,count,quantity])=>[charge,count,quantity]),placed);
+  if(byCount===null||byWeight===null||byItems===null)throw new BoundWithheld('no priceable inventory carries a packing that attains L0');
+  return bigMax([byCount,byWeight,byItems]);
+}
+/** Each ascending run with the instance count and total reached at its end, so a fit is a
+ *  binary search: `O(t)` once, `O(log t)` per question. */
+function runPrefix(runs){
+  let count=0n,total=0n;
+  return runs.map(([value,taken])=>{count+=taken;total+=value*taken;return [value,count,total]});
+}
+/** `boundFit` over a `runPrefix`: how many of the lightest instances sum to at most `capacity`.
+ *  The first run whose total passes it has a positive value, so it is taken in part. */
+function prefixFit(prefix,capacity){
+  if(capacity<0n)return 0n;
+  let low=0,high=prefix.length;
+  while(low<high){const middle=(low+high)>>1;if(prefix[middle][2]>capacity)high=middle;else low=middle+1}
+  const [,count,total]=low===0?[0n,0n,0n]:prefix[low-1];
+  return low===prefix.length?count:count+(capacity-total)/prefix[low][0];
+}
+/** The least cost covering `need` units from `[cost, capacity, quantity]` offers, taken
+ *  fractionally and rounded up, or null when the offers cannot cover it.
+ *
+ *  A fractional covering problem with one constraint is solved exactly by taking offers in
+ *  order of cost per unit, compared by cross-multiplication so no fraction is formed. Only the
+ *  last offer is taken in part, so the cost is an integer plus one ceiling. Offers of equal cost
+ *  per unit give the same total in either order, so the order needs no tie-break. Each offer is
+ *  limited by its type's whole inventory, which only weakens the bound. `O(k log k)`. */
+function fractionalCover(offers,need){
+  if(need<=0n)return 0n;
+  const ranked=offers.filter(([,capacity])=>capacity>0n).sort((a,b)=>bigAscending(a[0]*b[1],b[0]*a[1]));
+  let total=0n,remaining=need;
+  for(const [cost,capacity,quantity] of ranked){
+    if(quantity===null||quantity*capacity>=remaining)return total+boundCeilDiv(cost*remaining,capacity);
+    total+=cost*quantity;remaining-=capacity*quantity;
+  }
+  return null;
+}
+/** `floor(volume * weight ticks per unit / (length ticks per unit ^ 3 * divisor))`, in ticks. */
+const dimensionalTicks=(d,divisor,lengthUnit,weightUnit)=>volume(d)*BigInt(WT[weightUnit])/(BigInt(LEN[lengthUnit])**3n*BigInt(divisor));
+/** The rate table as `[bound in weight ticks, charge]`: the charge at a bracket's bound is that
+ *  bracket's, `max(price, minimum)` then the surcharge rounded up, exact in `BigInt`. */
+function boundBrackets(table){
+  if(table==null)return [];
+  const brackets=table.weight_brackets_g??[],prices=table.prices_minor??[];
+  const minimum=BigInt(table.minimum_charge_minor??0),fuel=BigInt(table.fuel_surcharge_permille??0);
+  return brackets.slice(0,prices.length).map((grams,index)=>{
+    const price=BigInt(prices[index]),base=price>minimum?price:minimum;
+    return [BigInt(grams)*BigInt(WT.g),base+boundCeilDiv(base*fuel,1000n)];
+  });
+}
+/** What a carrier can bill one container of a type, at the least. A rigid container
+ *  is billed on its declared outer size, else its declared inner one: a pallet whose load
+ *  overhangs is billed larger per side, never smaller, and dimensional weight only grows with
+ *  each side. A bag is billed on the package its contents make, which can be smaller than
+ *  declared, so its floor is 0. Null without the divisor the billed key needs. */
+function requestBilling(req,unit,measures){
+  const configuration=req.configuration??{},divisor=configuration.dimensional_weight_divisor;
+  if(divisor==null)return null;
+  const lengthUnit=configuration.dimensional_weight_length_unit??'in',weightUnit=configuration.dimensional_weight_weight_unit??'lb';
+  const landed=configuration.objective==='lowest_landed_cost';
+  return raw=>({tare:BigInt(measures.weight(raw.tare_weight??0)),
+    dimensional:raw.deformable_boundary!=null?0n:dimensionalTicks(measures.sides(raw.outer_dimensions??raw.inner_dimensions,unit),divisor,lengthUnit,weightUnit),
+    brackets:landed?boundBrackets(raw.rate_table):[]});
 }
 /** The request's bound in its objective's own score order, or null where none is stated.
  *
  *  Read from the request itself, as every engine reads it: every item type with its whole
  *  quantity (fixed placements are part of it), every container type, lengths in
  *  ticks and volumes formed in `BigInt` from them, never as a `Number` product converted
- *  afterwards (F3). Null for an objective with no bound, for a request with a made-to-measure
- *  container (D13), and for a request past a declared ceiling, which withholds the
- *  bound and nothing else (OPTIMALITY-GAP.md § 1.5). `O(t log t + c log c)` for `t` item
- *  types and `c` container types. */
+ *  afterwards (F3). Null for an objective with no bound, for a billed objective without its
+ *  divisor or whose inventory cannot carry a packing that attains `L0` at a price,
+ *  for a request with a made-to-measure container (D13), and for a request past a
+ *  declared ceiling, which withholds the bound and nothing else (OPTIMALITY-GAP.md § 1.5).
+ *  `O(t log t + c log c)` for `t` item types and `c` container types, and
+ *  `O(c b log t + c b log(c b))` more for `lowest_landed_cost`'s `b` brackets per type. */
 /** The inner size every solver packs: a pallet's widened frame, else the declared one. */
 function solvingDimensions(raw,unit,measures){const declared=measures.sides(raw.inner_dimensions,unit),limit=raw.pallet_overhang_limit;
   return limit==null?declared:solvingFrame(declared,measures.length(limit.length,unit),measures.length(limit.width,unit)).d}
@@ -904,6 +1065,8 @@ function requestBound(req,measures){
   const rawContainers=req.containers??[];
   if(rawContainers.some(c=>c.made_to_measure!=null))return null;
   const unit=req.units?.length??'mm';
+  const billing=BILLED_OBJECTIVES.has(req.configuration?.objective)?requestBilling(req,unit,measures):()=>({});
+  if(billing===null)return null;
   const items=(req.items??[]).map(raw=>({raw,count:BigInt(raw.quantity??1)})).filter(item=>item.count>0n);
   const volumes=boundRuns(items.map(({raw,count})=>[volume(measures.sides(raw.dimensions,unit)),count]));
   const weights=boundRuns(items.map(({raw,count})=>[BigInt(measures.weight(raw.weight??0)),count]));
@@ -915,10 +1078,10 @@ function requestBound(req,measures){
       baseArea:BigInt(d[0])*BigInt(d[1]),height:BigInt(d[2]),
       payload:raw.max_payload==null?null:BigInt(measures.weight(raw.max_payload)),
       maxItems:raw.max_items==null?null:BigInt(raw.max_items),
-      quantity:raw.quantity==null?null:BigInt(raw.quantity),costMinor:BigInt(raw.cost_minor??0)};
+      quantity:raw.quantity==null?null:BigInt(raw.quantity),costMinor:BigInt(raw.cost_minor??0),...billing(raw)};
   });
   try{return objectiveVector(order,volumes,weights,values,shrinks,containers)}
-  catch(error){if(error instanceof BoundOverflowError)return null;throw error}
+  catch(error){if(error instanceof BoundOverflowError||error instanceof BoundWithheld)return null;throw error}
 }
 /** What one score states against `bound`, both in the result's own score order
  *  (OPTIMALITY-GAP.md § 1.1): the bound through the first missed position with the gap
@@ -959,10 +1122,20 @@ export function __runSmallestUnsortedForTests(pairs,count){return runSmallestUns
 export function __objectiveVectorForTests(instances,containers,objective){
   const runs=field=>boundRuns(instances.map(i=>[i[field],1n]));
   try{return objectiveVector(BOUND_ORDERS.get(objective),runs('volume'),runs('weight'),instances.map(i=>[i.value,1n]),instances.some(i=>i.shrinks),containers)}
-  catch(error){if(error instanceof BoundOverflowError)return null;throw error}
+  catch(error){if(error instanceof BoundOverflowError||error instanceof BoundWithheld)return null;throw error}
 }
+export function __fractionalCoverForTests(offers,need){return fractionalCover(offers,need);}
+export function __billedWeightBoundForTests(weights,containers,placed,opened){return billedWeightBound(weights,containers,placed,opened);}
 export function __requestBoundForTests(req){return requestBound(req,requestMeasures().close());}
 export function __occupiesLessThanItsBoxForTests(item){return occupiesLessThanItsBox(item);}
+const BOX_SHAPE_ENTRIES=1024,boxShapes=new Map();
+/** One shared shape per box size, so a pair of shapes has a stable identity to be keyed by. */
+function boxShapeFor(dx,dy,dz){
+  const key=dx+','+dy+','+dz,found=boxShapes.get(key);
+  if(found!==undefined)return found;
+  if(boxShapes.size>=BOX_SHAPE_ENTRIES)boxShapes.clear();
+  const shape=boxShape(dx,dy,dz);boxShapes.set(key,shape);return shape;
+}
 function boxShape(dx,dy,dz){
   const v=[];
   for(const x of [0n,BigInt(dx)])for(const y of [0n,BigInt(dy)])for(const z of [0n,BigInt(dz)])v.push([x,y,z]);
@@ -989,17 +1162,34 @@ function separatingAxes(left,right){
   }
   return [...axes.values()];
 }
+/** The separating axes of an ordered pair of shapes and each shape's projection interval on
+ *  every one: all of it depends on the two shapes and not on where they sit, so a collision
+ *  only adds the origins' dot products. Keyed by the shapes' identities, which is sound because
+ *  `shapeFor` and `boxShapeFor` hand out one object per shape and nothing mutates a shape.
+ *  Bounded twice, by entries and by total axes, and emptied whole when either is passed, so the
+ *  contents depend only on the call sequence. */
+const PAIR_PLAN_ENTRIES=256,PAIR_PLAN_AXES=60000;
+const pairPlans=new Map(),shapeIds=new WeakMap();let pairPlanAxes=0,shapesIdentified=0;
+const shapeId=shape=>{let id=shapeIds.get(shape);if(id===undefined){id=++shapesIdentified;shapeIds.set(shape,id)}return id};
+const projectOnto=(shape,axis)=>{let low=null,high=null;
+  for(const v of shape.v){const value=dot3(v,axis);
+    if(low===null||value<low)low=value;if(high===null||value>high)high=value}
+  return [low,high]};
+function pairPlan(left,right){
+  const key=shapeId(left)+','+shapeId(right),found=pairPlans.get(key);
+  if(found!==undefined)return found;
+  const axes=separatingAxes(left,right),plan={axes,left:axes.map(axis=>projectOnto(left,axis)),right:axes.map(axis=>projectOnto(right,axis))};
+  if(pairPlans.size>=PAIR_PLAN_ENTRIES||pairPlanAxes+axes.length>PAIR_PLAN_AXES){pairPlans.clear();pairPlanAxes=0}
+  pairPlans.set(key,plan);pairPlanAxes+=axes.length;
+  return plan;
+}
 /** Do two placed hulls overlap with positive volume? Touching is contact, not collision: the
  *  comparison is `<=`, matching the half-open convention cuboids already use. */
 function hullsCollide(left,leftOrigin,right,rightOrigin){
-  const lo=big3(leftOrigin),ro=big3(rightOrigin);
-  for(const axis of separatingAxes(left,right)){
-    const project=shape=>{let low=null,high=null;
-      for(const v of shape.v){const value=dot3(v,axis);
-        if(low===null||value<low)low=value;if(high===null||value>high)high=value}
-      return [low,high]};
-    const [ll,lh]=project(left),[rl,rh]=project(right);
-    const ls=dot3(lo,axis),rs=dot3(ro,axis);
+  const lo=big3(leftOrigin),ro=big3(rightOrigin),{axes,left:leftSpans,right:rightSpans}=pairPlan(left,right);
+  for(let i=0;i<axes.length;i++){
+    const [ll,lh]=leftSpans[i],[rl,rh]=rightSpans[i];
+    const ls=dot3(lo,axes[i]),rs=dot3(ro,axes[i]);
     if(lh+ls<=rl+rs||rh+rs<=ll+ls)return false;
   }
   return true;
@@ -1066,8 +1256,8 @@ function solidsOverlapAt(candidateShape,x,y,z,ed,placed){
 function solidsOverlap(leftShape,leftBox,rightShape,rightBox){
   if(leftShape===null&&rightShape===null)return true;
   return hullsCollide(
-    leftShape??boxShape(leftBox.d[0],leftBox.d[1],leftBox.d[2]),[leftBox.x,leftBox.y,leftBox.z],
-    rightShape??boxShape(rightBox.d[0],rightBox.d[1],rightBox.d[2]),[rightBox.x,rightBox.y,rightBox.z]);
+    leftShape??boxShapeFor(leftBox.d[0],leftBox.d[1],leftBox.d[2]),[leftBox.x,leftBox.y,leftBox.z],
+    rightShape??boxShapeFor(rightBox.d[0],rightBox.d[1],rightBox.d[2]),[rightBox.x,rightBox.y,rightBox.z]);
 }
 /** Space one placement actually takes, which is its box only if it is one.
  *
@@ -1109,7 +1299,7 @@ function itemOccupiedVolume(item){
  *  Nominal volume is not additive under nesting, so that half stands down there. O(n + t). */
 function additionalContainerBound(plan,templates){const available=templates.filter(t=>plan.inventory.get(t.id)>0);if(!plan.remaining.length||!available.length)return 0;let lower=0;
   if(!plan.remaining.some(item=>item.nesting!=null)){const capacity=available.reduce((best,t)=>volume(t.d)>best?volume(t.d):best,0n),required=plan.remaining.reduce((sum,item)=>sum+itemOccupiedVolume(item),0n);if(capacity>0n)lower=Math.max(lower,Number((required+capacity-1n)/capacity))}
-  if(available.every(t=>t.max!=null)){const capacity=Math.max(...available.map(t=>t.max)),required=plan.remaining.reduce((sum,item)=>sum+item.w,0n);if(capacity>0)lower=Math.max(lower,Math.ceil(required/capacity))}return lower}
+  if(available.every(t=>t.max!=null)){const capacity=available.reduce((best,t)=>t.max>best?t.max:best,0n),required=plan.remaining.reduce((sum,item)=>sum+item.w,0n);if(capacity>0n)lower=Math.max(lower,Number((required+capacity-1n)/capacity))}return lower}
 export function __additionalContainerBoundForTests(plan,templates){return additionalContainerBound(plan,templates)}
 /** First compressible box carrying more pressure than it declared it can take.
  *
@@ -1339,7 +1529,7 @@ function axleBalancedPoints(container,placements,points,item,clearance){
     const {front,rear}=axleBalancedOrigins(container,load,item.w,length),last=BigInt(container.d[0]-length);
     for(const origin of [front,rear])if(origin!=null&&origin>=0n&&origin<=last)for(const y of floorYs)out.push([Number(origin),y,0])}
   return out}
-function fitsTemplateAlone(c,d){return d.every((edge,k)=>edge<=c.d[k])&&(!c.bag||(d[0]+d[2]<=c.d[0]&&d[1]+d[2]<=c.d[1]+c.gusset))}
+function fitsTemplateAlone(c,d){return d.every((edge,k)=>edge<=c.d[k])&&(!c.bag||girthAdmits(c.girth,d))}
 // The container limit that left an item out, for the search_exhausted
 // fallback, or null when none explains it. The same rule, in the same order, as every
 // engine: an axle that refuses the item alone in every container otherwise admitting it,
@@ -1441,6 +1631,24 @@ function doubleFraction(value){
   const mantissa=exponent===0?fraction:fraction|(1n<<52n),shift=(exponent===0?1:exponent)-1075;
   return shift>=0?[mantissa<<BigInt(shift),1n]:[mantissa,1n<<BigInt(-shift)];
 }
+// The double nearest an exact integer ratio -- Python's `int / int`, which every engine's
+// `support_ratio` and `volume_utilization` is defined as (docs/UNITS-AND-NUMERICS.md). A volume in
+// ticks passes 2^53, where dividing two rounded Numbers would round twice. Both operands are
+// non-negative integers (Number or BigInt) and the denominator is positive. O(1).
+function ratioDouble(numerator,denominator){
+  if(Number.isSafeInteger(numerator)&&Number.isSafeInteger(denominator))return numerator/denominator;
+  const n=BigInt(numerator),d=BigInt(denominator);if(n===0n)return 0;
+  // Scale so the quotient carries 54 or 55 bits: 53 to keep, and at least one to round on.
+  const shift=54-(n.toString(2).length-d.toString(2).length);
+  const scaled=shift>=0?n<<BigInt(shift):n,divisor=shift>=0?d:d<<BigInt(-shift);
+  const quotient=scaled/divisor,inexact=scaled%divisor!==0n,extra=BigInt(quotient.toString(2).length-53);
+  const half=1n<<(extra-1n),tail=quotient&((1n<<extra)-1n);let mantissa=quotient>>extra;
+  if(tail>half||(tail===half&&(inexact||mantissa%2n===1n)))mantissa+=1n;
+  return Number(mantissa)*2**(Number(extra)-shift);
+}
+// A reported ratio: six places of that double, as Python's `f"{a / b:.6f}"` writes it. An exact
+// decimal half therefore follows the double it lands on (50/20000000 -> 0.000003), not the even digit.
+const ratioPlaces=(numerator,denominator)=>sixPlaces(...doubleFraction(ratioDouble(numerator,denominator)));
 // `decimalString` for a safe-integer tick count, in Number arithmetic. Every intermediate is an
 // integer below 10 * divisor or below |v|, so each `%` and each exact quotient is exact and the
 // digits, the rounding and the text are the BigInt path's own; a result writes six of these per
@@ -1595,6 +1803,14 @@ function compareFarCorner(a,b){const ae=a.ed,be=b.ed;
   return (a.z+ae[2])-(b.z+be[2])||(a.y+ae[1])-(b.y+be[1])||(a.x+ae[0])-(b.x+be[0])
     ||a.z-b.z||a.y-b.y||a.x-b.x
     ||(a.item.shapeType==='convex_hull'?ROT_INDEX[a.r]-ROT_INDEX[b.r]:0)}
+// S-08: the order each solver alias ranks candidates by, field by field. These were weighted sums
+// (`z*1e12+y*1e6+x` and the like) that pass 2^53 at realistic sizes, so sub-ulp steps collapsed to
+// ties and a term outweighed the next one. Each is the lexicographic reading of the sum it replaces.
+const compareOriginFirst=(a,b)=>a.z-b.z||a.y-b.y||a.x-b.x;
+const compareLayered=(a,b)=>(a.z+a.ed[2])-(b.z+b.ed[2])||a.z-b.z||a.y-b.y||a.x-b.x;
+const compareMaximalSpaces=(a,b)=>(a.z+a.ed[2])-(b.z+b.ed[2])||(a.x+a.ed[0]+a.y+a.ed[1])-(b.x+b.ed[0]+b.y+b.ed[1]);
+// A multi-drop sweep ranks x first, so what leaves last stands deepest.
+const compareRouteFirst=(a,b)=>(a.x+a.ed[0])-(b.x+b.ed[0])||(a.y+a.ed[1])-(b.y+b.ed[1])||(a.z+a.ed[2])-(b.z+b.ed[2]);
 // Keep only the requested prefix: the root is the worst score, latest tie first.
 // Ordinals make heap eviction preserve the stable full-sort order exactly.
 function compareRetained(a,b,tieBreak=noTieBreak){return a.score-b.score||tieBreak(a.candidate,b.candidate)||a.ordinal-b.ordinal}
@@ -1672,11 +1888,22 @@ function groundContactAllowed(candidate,placed,supports=null){const rule=candida
   if(rule==='covered'){const corners=[[box.x,box.y],[box.x+box.d[0],box.y],[box.x,box.y+box.d[1]],[box.x+box.d[0],box.y+box.d[1]]];return corners.every(([x,y])=>supporters.some(({placement})=>{const d=placementDimensions(placement);return placement.x<=x&&x<=placement.x+d[0]&&placement.y<=y&&y<=placement.y+d[1]}))}return true}
 /**: a candidate may not become the second supporter of an item already resting on exactly
  *  one, as `ground_contact_rule: single` requires; the item's own check ran before the candidate
- *  existed. Only items whose base the candidate's top face reaches are counted again. O(n). */
-function singleSupportsKept(candidate,placed){
-  const top=candidate.z+placementDimensions(candidate)[2];let scene=null;
-  for(const other of placed){
-    if(other.item.groundRule!=='single'||other.z!==top)continue;
+ *  existed. Only items whose base is the candidate's top plane can gain it, and only through
+ *  footprint overlap: a nested predecessor shares its column's footprint. A searched,
+ *  non-nesting item there already rests on exactly one supporter -- its own check, kept since
+ *  by this one -- so touching it makes two and is refused without a recount. Fixed and nesting
+ *  items entered without that guarantee or can shadow a face contact, so they are recounted
+ *  exactly. O(b) per candidate for the b placements on that plane, plus O(n) for each fixed or
+ *  nesting single-rule item there. */
+function singleSupportsKept(candidate,placed,sweep){
+  const dimensions=placementDimensions(candidate),level=sweep.bottomPlane().get(candidate.z+dimensions[2]);
+  if(level===undefined)return true;
+  let scene=null;
+  for(let index=0;index<level.length;index++){const other=level[index];
+    if(other.item.groundRule!=='single')continue;
+    if(!other.fixed&&placementNesting(other)==null){
+      if(footprintOverlap(other,candidate.x,candidate.y,dimensions[0],dimensions[1])>0)return false;
+      continue}
     if(scene===null)scene=[...placed,candidate];
     if(directSupporters(other,scene).length!==1)return false;
   }
@@ -1913,7 +2140,7 @@ function allowed(candidate,placed,container,globalSupportPpm,metrics,loadBase=nu
   const needsLoads=container.maxStackDensity!=null||candidate.item.maxTop!=null||scene.placedMaxTop
     ||candidate.item.maxCompressionKpa!=null||scene.placedCompressible;
   const needsGraph=needsLoads||candidate.item.maxStacked!=null||scene.placedMaxStacked;
-  if(!groundContactAllowed(candidate,placed,supports)||!singleSupportsKept(candidate,placed)||!routeContactAllowed(candidate,placed,supports,scene))return false;
+  if(!groundContactAllowed(candidate,placed,supports)||!singleSupportsKept(candidate,placed,scene)||!routeContactAllowed(candidate,placed,supports,scene))return false;
   if(!needsGraph)return accessBase===null||accessBase.inert||accessibleAgainst(accessBase,corridorBox(candidate));
   // With a base for this sweep, both the box list and the graph come from it by
   // appending one box, rather than each candidate rebuilding both from every placement.
@@ -2196,8 +2423,8 @@ function compactGridResult(req,{measures,u,ou,ow,clear,objective,dimensionalWeig
   // `shipping_cost`, whose proxy it is; re-enabling compact for landed cost would
   // resurrect the MAX_SAFE_INTEGER leak, since this return path has no refusal.
   templates.sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'
-    ?compareWeights(dimensionalWeight(a.outerD),dimensionalWeight(b.outerD))||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))
-    :(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d)));
+    ?compareWeights(dimensionalWeight(a.outerD),dimensionalWeight(b.outerD))||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))||compareCodePoints(a.id,b.id)
+    :(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))||compareCodePoints(a.id,b.id));
   let remaining=quantity,scoreCost=0,scoreUnused=0,scoreHeight=0,scoreBillable=0n,scoreLanded=0,scoreAchievedHeight=0;
   const containers=[],maxContainers=req.configuration?.max_containers??Infinity;
   // Per-unit capacity depends only on (item, template), both fixed for the
@@ -2323,7 +2550,7 @@ function compactGridResult(req,{measures,u,ou,ow,clear,objective,dimensionalWeig
         id:`${template.id}#${plan.opened}`,container_type:template.id,inner_dimensions:outDims(template.d,ou),
         outer_dimensions:outDims(template.outerD,ou),payload_weight:outWeight(payload,ow),
         gross_weight:outWeight(payload+template.tare,ow),used_volume_ticks3:used.toString(),
-        volume_utilization:sixPlaces(used,volume(template.d)),
+        volume_utilization:ratioPlaces(used,volume(template.d)),
         centre_of_mass_offset_ppm:latticeCentreOfMassOffsetPpm(summary,template.d),
         void_fill_reserve_ticks3:'0',
         placements:wantCoordinates?latticePlacements({best,count,firstIndex,raw,weight,clear,ou,ow,containerId:`${template.id}#${plan.opened}`}):[],
@@ -2397,7 +2624,7 @@ function compactGridResult(req,{measures,u,ou,ow,clear,objective,dimensionalWeig
   const defaultScore=[remaining,containers.length,scoreCost,scoreUnused,scoreHeight];
   const score=objective==='lowest_cost'?[defaultScore[0],defaultScore[2],defaultScore[1],defaultScore[3],defaultScore[4]]
     :objective==='shipping_cost'?[defaultScore[0],exactTicks(scoreBillable),defaultScore[1],defaultScore[3],defaultScore[4]]
-      :objective==='lowest_landed_cost'?[defaultScore[0],scoreLanded,defaultScore[1],defaultScore[3],defaultScore[4]]
+      :objective==='lowest_landed_cost'?[defaultScore[0],reportedLanded(scoreLanded),defaultScore[1],defaultScore[3],defaultScore[4]]
       :objective==='open_dimension_height'?[defaultScore[0],scoreAchievedHeight,defaultScore[1],defaultScore[2],defaultScore[3]]
         :objective==='maximum_value'?[defaultScore[0],remaining*(raw.value??0),defaultScore[1],defaultScore[2],defaultScore[3]]
           // One item type, so the most pieces is also the most volume and the lattice needs
@@ -2601,14 +2828,14 @@ function subtractBlock(spaces,box,metrics){metrics.space_partitions+=spaces.leng
   // In this order a space that contains another sorts before it: its origin is no greater
   // on every axis, and at an equal origin its volume is larger (no two spaces here are equal),
   // so a slab is tested only against the spaces ahead of it.
-  const kept=out.sort((a,b)=>a.z-b.z||a.y-b.y||a.x-b.x||(a.volume>b.volume?-1:1));
+  const kept=out.sort((a,b)=>a.z-b.z||a.y-b.y||a.x-b.x||(a.volume>b.volume?-1:a.volume<b.volume?1:0));
   let result=kept.filter((space,index)=>!fresh.has(space)||!containedByEarlier(kept,index));
   if(result.length>256)result=result.sort((a,b)=>a.volume>b.volume?-1:a.volume<b.volume?1:a.z-b.z||a.y-b.y||a.x-b.x).slice(0,256).sort((a,b)=>a.z-b.z||a.y-b.y||a.x-b.x);
   return result}
 // The result writer's shortcuts, held to the code paths they bypass by
 // `test/result-writer.test.mjs`.
 export const __resultWriterForTests=Object.freeze({decimalString,usedVolume,validNesting,occupiedVolume});
-export const __ratiosForTests=Object.freeze({scaledRatio,supportPpm,sixPlaces,doubleFraction});
+export const __ratiosForTests=Object.freeze({scaledRatio,supportPpm,sixPlaces,doubleFraction,ratioDouble,ratioPlaces});
 export const __planBeamForTests=Object.freeze({compareIdLists,planSignature});
 export const __blockGroupForTests=Object.freeze({nodes:blockGroupNodes,stop:blockStopNode,best:blockGroupBest,typeTally:blockTypeTally,
   space:blockSpace,subtract:subtractBlock});
@@ -2937,6 +3164,8 @@ let timeLimitReached=false;
 // Python, PHP and Rust read it every 64th node: a counted limit is still checked at each
 // one, and only where a wall-clock stop lands can move.
 let candidateClockTick=0;
+// True only while the support diagnosis replays a finished layout: that verdict is a function of the request and the layout, so it must not read the clock.
+let replayingSupport=false;
 const metrics={candidate_points_considered:0,orientations_considered:0,feasible_candidates:0,collision_checks:0,support_checks:0,space_partitions:0,search_nodes_expanded:0};
 // The value of each budgeted counter at which the effort budget stops this frame's search;
 // Infinity for a limit the request leaves out. `let`: the support replay lifts them, as
@@ -3058,8 +3287,11 @@ if(startOrder?.seen!=null){const typeOf=new Map(req.items.map((raw,index)=>[raw,
   for(let at=0;at+1<items.length;at++)if(sequence[at]!==sequence[at+1]&&leadOrder(items[at],items[at+1])===0)startOrder.swappable.push(at)}
 // A pallet becomes its solving frame here, once, with the deck inside it; every solver
 // below packs the frame, and only the floor-support rule and the reporting read the deck.
+// A standing bag is packed in its `W x H x L` frame the same way, and only the girth
+// rule and the reported inner size read the declared one.
 const templates=req.containers.map(c=>{const declared=measures.sides(c.inner_dimensions,u),limit=c.pallet_overhang_limit;
-  const frame=limit==null?null:solvingFrame(declared,measures.length(limit.length,u),measures.length(limit.width,u)),d=frame===null?declared:frame.d,axleSpec=c.axles==null?null:c.axles.map(a=>({position:measures.length(a.position,u),max:a.max_load==null?null:measures.weight(a.max_load)}));
+  const girth=bagGirth(c.deformable_boundary,declared,value=>measures.length(value,u));
+  const frame=limit==null?null:solvingFrame(declared,measures.length(limit.length,u),measures.length(limit.width,u)),d=frame!==null?frame.d:girth?.standing?standingFrame(declared):declared,axleSpec=c.axles==null?null:c.axles.map(a=>({position:measures.length(a.position,u),max:a.max_load==null?null:measures.weight(a.max_load)}));
   if(axleSpec&&(axleSpec.length!==2||axleSpec[0].position>=axleSpec[1].position||axleSpec[0].position<0||axleSpec[1].position>d[0]))throw new RangeError('axles must be [front, rear] inside the container');
   const reservePpm=scaledRatio(c.void_fill_reserve_ratio??0);
   if(c.tag_limits!=null&&(typeof c.tag_limits!=='object'||Array.isArray(c.tag_limits)||Object.values(c.tag_limits).some(limit=>!Number.isSafeInteger(limit)||limit<1)))throw new RangeError('tag_limits must map strings to positive safe integers');
@@ -3074,10 +3306,10 @@ const templates=req.containers.map(c=>{const declared=measures.sides(c.inner_dim
   // Python, PHP and Rust decoders apply, and the reason all four agree on the answer.
   validateDirections(c.access_directions??[]);
   const doors=Object.freeze(ALL_DIRECTIONS.filter(d=>(c.access_directions??[]).includes(d)));
-  return {...c,d,outerD,deck:frame===null?null:frame.deck,doors,bag:c.deformable_boundary!=null,gusset:c.deformable_boundary?.side_gusset_depth==null?0:measures.length(c.deformable_boundary.side_gusset_depth,u),machine:parseMachine(c.made_to_measure,u,measures),max:c.max_payload==null?null:measures.weight(c.max_payload),tare:measures.weight(c.tare_weight??0),axleSpec,reservePpm,
+  return {...c,d,outerD,deck:frame===null?null:frame.deck,doors,bag:girth!==null,girth,machine:parseMachine(c.made_to_measure,u,measures),max:c.max_payload==null?null:measures.weight(c.max_payload),tare:measures.weight(c.tare_weight??0),axleSpec,reservePpm,
     innerVolume:volume(d),reserve:volume(d)*BigInt(reservePpm)/BigInt(SUPPORT_SCALE),
     rate:parseRateTable(c.rate_table),tagLimits:c.tag_limits??{},maxStackDensity,
-    obs:(c.obstacles??[]).flatMap(o=>[o,...(o.additional_boxes??[])]).map(o=>({x:measures.length(o.origin?.x??0,u),y:measures.length(o.origin?.y??0,u),z:measures.length(o.origin?.z??0,u),d:measures.sides(o.dimensions,u)}))}}).sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'?(compareWeights(dimensionalWeight(a.outerD),dimensionalWeight(b.outerD))||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))):((a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))));
+    obs:(c.obstacles??[]).flatMap(o=>[o,...(o.additional_boxes??[])]).map(o=>({x:measures.length(o.origin?.x??0,u),y:measures.length(o.origin?.y??0,u),z:measures.length(o.origin?.z??0,u),d:measures.sides(o.dimensions,u)}))}}).sort((a,b)=>objective==='shipping_cost'||objective==='lowest_landed_cost'?(compareWeights(dimensionalWeight(a.outerD),dimensionalWeight(b.outerD))||(a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))||compareCodePoints(a.id,b.id)):((a.cost_minor??0)-(b.cost_minor??0)||Number(volume(a.d)-volume(b.d))||compareCodePoints(a.id,b.id)));
 // Admission of fixed placements, before any search: the containers they name, each holding
 // only its fixed items, in opening order. Their instances leave the free list.
 const fixedGroups=admitFixedPlacements(req,{items,templates,u,clear});
@@ -3162,7 +3394,7 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
   // With no doors the base is inert and admits every candidate, so the sweep skips building it.
   const accessBase=tmpl.doors.length?stopAccessibilityBase(item.stopIndex,state.placements,tmpl,tmpl.doors):null;
   const compressionSensitive=item.shapeType==='compressible'||anyCompressiblePlaced(state.placements);
-  const found=[];let bestScore=0;
+  const found=[];
   // Fixed for the sweep: neither the doors nor any placed stop change inside it.
   const routeSensitive=tmpl.doors.length>0&&(item.stopIndex!=null||state.placements.some(p=>p.item.stopIndex!=null));
   // JavaScript registers no candidate scorers, so the extreme-point score is Rust's empty
@@ -3170,7 +3402,7 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
   // The grid stands down for a pallet as the reference's does, to the extreme-point order.
   const alias=solverAlias==='grid'&&tmpl.deck!=null?'extreme_points':solverAlias;
   const farCornerRanked=alias!=='grid'&&alias!=='layer'&&alias!=='maximal_spaces'&&!routeSensitive;
-  const tieBreak=farCornerRanked?compareFarCorner:noTieBreak;
+  const tieBreak=farCornerRanked?compareFarCorner:alias==='grid'?compareOriginFirst:alias==='layer'?compareLayered:alias==='maximal_spaces'?compareMaximalSpaces:compareRouteFirst;
   // Everything that is a function of (item, rotation) alone -- the rotated envelope, the
   // volume it occupies, its hull -- is computed once per sweep here rather than once per
   // point, the class of waste docs/PERFORMANCE-PRACTICE.md ranks first. The volume gate is
@@ -3192,18 +3424,20 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
     orientations.push({r,pd,ed,shape:exactHull?shapeFor(item.hullVertices,r):null,
       volumeBlocked:boxVolumeBlocked??(volumeGated&&occupiedVolume({pd,r,item})>volumeRoom)})}
   const [innerX,innerY,innerZ]=tmpl.d,obstacles=tmpl.obs;
-  // A bag also needs a + c <= L and b + c <= W + G over the extents grown by the candidate
-  // (G is a gusseted bag's side gusset, 0 for a flat one): O(p) once per sweep,
+  // A bag also needs both loops of film round the extents grown by the candidate (`bagGirth`:
+  //, 1.10 side gussets, bottom gussets and standing): O(p) once per sweep,
   // O(1) per candidate, and a verdict never flips later.
   // Read as scalars, not destructured, so a rigid container pays nothing for the rule.
   const bag=Boolean(tmpl.bag),bagExtents=bag?bagExtent(placements):null,bagX=bag?bagExtents[0]:0,bagY=bag?bagExtents[1]:0,bagZ=bag?bagExtents[2]:0;
-  const girthY=innerY+(bag?tmpl.gusset:0);
+  const standing=bag&&tmpl.girth.standing,bottomGusset=bag?tmpl.girth.bottom:0,sideGusset=bag?tmpl.girth.side:0;
   const baseAxle=tmpl.axleSpec==null?null:axleLoad(tmpl,placements);
   candidatePoints:for(let pointIndex=0;pointIndex<candidates.length;pointIndex++){const pt=candidates[pointIndex];if(effortStopped||metrics.orientations_considered>=attemptCeiling){effortStopped=true;break}metrics.candidate_points_considered++;const x=pt[0],y=pt[1],z=pt[2];
-    for(let orientationIndex=0;orientationIndex<orientations.length;orientationIndex++){const orientation=orientations[orientationIndex];if(effortStopped||metrics.orientations_considered>=attemptCeiling){effortStopped=true;break candidatePoints}metrics.orientations_considered++;if((candidateClockTick++&63)===0&&deadline.expired()){timeLimitReached=true;break candidatePoints}
+    for(let orientationIndex=0;orientationIndex<orientations.length;orientationIndex++){const orientation=orientations[orientationIndex];if(effortStopped||metrics.orientations_considered>=attemptCeiling){effortStopped=true;break candidatePoints}metrics.orientations_considered++;if((candidateClockTick++&63)===0&&!replayingSupport&&deadline.expired()){timeLimitReached=true;break candidatePoints}
     const {r,pd,ed}=orientation,x2=x+ed[0],y2=y+ed[1],z2=z+ed[2];
     if(x2>innerX||y2>innerY||z2>innerZ)continue;
-    if(bag&&(Math.max(x2,bagX)+Math.max(z2,bagZ)>innerX||Math.max(y2,bagY)+Math.max(z2,bagZ)>girthY))continue;
+    // The frame's own sides are the loops' bounded sides: L is innerX lying flat and innerZ standing.
+    if(bag&&(standing?2*((Math.max(z2,bagZ)-innerZ)+Math.max(y2,bagY))>bottomGusset||(Math.max(x2,bagX)-innerX)+Math.max(y2,bagY)>sideGusset
+      :2*((Math.max(x2,bagX)-innerX)+Math.max(z2,bagZ))>bottomGusset||(Math.max(y2,bagY)-innerY)+Math.max(z2,bagZ)>sideGusset))continue;
     if(payloadBlocked||countBlocked||orientation.volumeBlocked)continue;
     let candidate=nests?{x,y,z,pd,ed,r,item}:null,box=null;
     if(nests&&!compressionSensitive&&usedVolumeDelta(placements,candidate)>volumeRoom)continue;
@@ -3255,14 +3489,8 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
     // not the attempts before it that find nothing feasible.
     if(metrics.feasible_candidates>=candidateCeiling){effortStopped=true;break candidatePoints}
     metrics.feasible_candidates++;
-    const score=farCornerRanked?0:alias==='grid'
-      ?z*1e12+y*1e6+x
-      :alias==='layer'
-        ?z2*1e12+z*1e8+y*1e4+x
-        :alias==='maximal_spaces'
-          ?x2+y2+z2*1e6
-          :x2*1e9+y2*1e4+z2;
-    if(width===1){if(!found.length||(score-bestScore||tieBreak(candidate,found[0]))<0){found[0]=candidate;bestScore=score}continue}
+    const score=0;
+    if(width===1){if(!found.length||tieBreak(candidate,found[0])<0)found[0]=candidate;continue}
     if(width!=null){retainCandidate(found,width,score,metrics.feasible_candidates,candidate,tieBreak);continue}
     found.push({score,candidate})}}
   // A returned candidate is the box itself, without its score: it becomes a placement, and a
@@ -3282,7 +3510,7 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
 // already run.
 const candidatesFor=(tmpl,item,state,points,index,used,width,supportRatioPpm)=>{
   const found=sweepCandidates(tmpl,item,state,points.length>maxCandidatePoints?points.slice(0,maxCandidatePoints):points,index,used,width,supportRatioPpm);
-  if(tmpl.axleSpec==null||item.w<=0||found.length||timeLimitReached)return found;
+  if(tmpl.axleSpec==null||item.w<=0||found.length||(timeLimitReached&&!replayingSupport))return found;
   return sweepCandidates(tmpl,item,state,axleBalancedPoints(tmpl,state.placements,points,item,clear),index,used,width,supportRatioPpm)};
 const tryPackIntoTemplate=(tmpl,itemsRemaining)=>{const seeded=seedState(tmpl),state=seeded.state;const next=[];
   // Running `usedVolume` of `state.placements`, maintained incrementally rather than
@@ -3600,7 +3828,7 @@ const blockLattices=prototype=>{const seen=new Set(),lattices=[];
 // of the space and a capacity alone, and a lattice of the type alone.
 const blockStart=(tmpl,itemsRemaining)=>{const byType=new Map();
   for(const item of itemsRemaining){const values=byType.get(item.raw.id)??[];values.push(item);byType.set(item.raw.id,values)}
-  return {state:{tmpl,placements:[],payload:0n},spaces:[blockSpace(0,0,0,tmpl.d.slice())],byType,itemIds:[...byType.keys()].sort(),lattices:new Map()}};
+  return {state:{tmpl,placements:[],payload:0n},spaces:[blockSpace(0,0,0,tmpl.d.slice())],byType,itemIds:[...byType.keys()].sort(compareCodePoints),lattices:new Map()}};
 const blockOpen=round=>round.spaces.length>0&&[...round.byType.values()].some(values=>values.length);
 const blockCopy=round=>({state:{tmpl:round.state.tmpl,placements:round.state.placements.slice(),payload:round.state.payload},
   spaces:round.spaces,byType:new Map([...round.byType].map(([key,values])=>[key,values.slice()])),itemIds:round.itemIds,lattices:round.lattices});
@@ -3860,7 +4088,7 @@ if(containerPlanBeamWidth>1&&solverAlias!=='exact_small'){
   for(const c of packed){const n=(counts.get(c.tmpl.id)??0)+1;counts.set(c.tmpl.id,n);c.seq=n}}
 const containers=packed.map(c=>{const loads=topLoads(c.placements.map(constraintBox)),used=usedVolume(c.placements),topPlane=bucketByPlane(c.placements,p=>p.z+placementDimensions(p)[2]);
   const reaction=axleReactions(c.tmpl,c.placements);
-  return {id:`${c.tmpl.id}#${c.seq}`,container_type:c.tmpl.id,inner_dimensions:outDims(declaredInner(c.tmpl.d,c.tmpl.deck),ou),outer_dimensions:outDims(c.tmpl.machine?c.tmpl.outerD:c.tmpl.outer_dimensions?dims(c.tmpl.outer_dimensions,u):declaredInner(c.tmpl.d,c.tmpl.deck),ou),...(c.tmpl.deck!=null?{achieved_dimensions:outDims(achievedDimensions(c.tmpl.deck,c.placements),ou)}:c.tmpl.bag||c.tmpl.machine?{achieved_dimensions:outDims(bagExtent(c.placements),ou)}:{}),...(c.tmpl.machine?{made_to_measure:{cost_minor:c.tmpl.cost_minor,tare_weight:outWeight(c.tmpl.tare,ow)}}:{}),payload_weight:outWeight(c.payload,ow),gross_weight:outWeight(c.payload+c.tmpl.tare,ow),used_volume_ticks3:used.toString(),volume_utilization:sixPlaces(used,volume(c.tmpl.d)),centre_of_mass_offset_ppm:centreOfMassOffsetPpm(c.tmpl,c.placements,clear),...(reaction==null?{}:{axle_reactions:{basis:'gross',denominator:reaction.denominator.toString(),front_numerator:reaction.front.toString(),rear_numerator:reaction.rear.toString()}}),void_fill_reserve_ticks3:(volume(c.tmpl.d)*BigInt(c.tmpl.reservePpm)/BigInt(SUPPORT_SCALE)).toString(),placements:c.placements.map((p,i)=>({placement_id:placementId(`${c.tmpl.id}#${c.seq}`,[p.x+clear,p.y+clear,p.z+clear],p.item.raw.id,p.r),item_id:p.item.id,item_type:p.item.raw.id,position:outPoint({x:p.x+clear,y:p.y+clear,z:p.z+clear},ou),dimensions:outDims(p.pd,ou),orientation:p.r,support_ratio:sixPlaces(...(p.fixed?p.fixedSupport:supportFraction(p,c.placements,topPlane,c.tmpl.deck))),top_load:outWeight(loads[i],ow),...(p.fixed?{fixed:true}:{})}))}});
+  return {id:`${c.tmpl.id}#${c.seq}`,container_type:c.tmpl.id,inner_dimensions:outDims(declaredFrame(c.tmpl),ou),outer_dimensions:outDims(c.tmpl.machine?c.tmpl.outerD:c.tmpl.outer_dimensions?dims(c.tmpl.outer_dimensions,u):declaredFrame(c.tmpl),ou),...(c.tmpl.deck!=null?{achieved_dimensions:outDims(achievedDimensions(c.tmpl.deck,c.placements),ou)}:c.tmpl.bag||c.tmpl.machine?{achieved_dimensions:outDims(bagExtent(c.placements),ou)}:{}),...(c.tmpl.machine?{made_to_measure:{cost_minor:c.tmpl.cost_minor,tare_weight:outWeight(c.tmpl.tare,ow)}}:{}),payload_weight:outWeight(c.payload,ow),gross_weight:outWeight(c.payload+c.tmpl.tare,ow),used_volume_ticks3:used.toString(),volume_utilization:ratioPlaces(used,volume(c.tmpl.d)),centre_of_mass_offset_ppm:centreOfMassOffsetPpm(c.tmpl,c.placements,clear),...(reaction==null?{}:{axle_reactions:{basis:'gross',denominator:reaction.denominator.toString(),front_numerator:reaction.front.toString(),rear_numerator:reaction.rear.toString()}}),void_fill_reserve_ticks3:(volume(c.tmpl.d)*BigInt(c.tmpl.reservePpm)/BigInt(SUPPORT_SCALE)).toString(),placements:c.placements.map((p,i)=>({placement_id:placementId(`${c.tmpl.id}#${c.seq}`,[p.x+clear,p.y+clear,p.z+clear],p.item.raw.id,p.r),item_id:p.item.id,item_type:p.item.raw.id,position:outPoint({x:p.x+clear,y:p.y+clear,z:p.z+clear},ou),dimensions:outDims(p.pd,ou),orientation:p.r,support_ratio:ratioPlaces(...(p.fixed?p.fixedSupport:supportFraction(p,c.placements,topPlane,c.tmpl.deck))),top_load:outWeight(loads[i],ow),...(p.fixed?{fixed:true}:{})}))}});
 const fitsWithRotations=(i,rots)=>templates.some(c=>rots.some(r=>fitsTemplateAlone(c,rotate(i.d,r).map(x=>x+2*clear))));
 const openedByType=new Map();for(const c of packed)openedByType.set(c.tmpl.id,(openedByType.get(c.tmpl.id)??0)+1);
 // Python's and PHP's `support_is_the_blocker`. Each packed container's final scene is
@@ -3877,10 +4105,10 @@ const supportIsTheBlocker=i=>{
   const unsupported={...i,supportPpm:0,groundRule:null},counters={...metrics},reached=timeLimitReached,tick=candidateClockTick;
   // The replay diagnoses a finished search, so the effort budget neither bounds it nor can be
   // stopped by it: a verdict must not depend on how close the search came to its limit.
-  const ceilings=[attemptCeiling,candidateCeiling,nodeCeiling];attemptCeiling=candidateCeiling=nodeCeiling=Infinity;
+  const ceilings=[attemptCeiling,candidateCeiling,nodeCeiling];attemptCeiling=candidateCeiling=nodeCeiling=Infinity;replayingSupport=true;
   const fits=(scene,item,ratio)=>candidatesFor(scene.tmpl,item,scene.state,scene.points,scene.index,scene.used,1,ratio).length>0;
   const blocked=finishedScenes.some(scene=>fits(scene,unsupported,0)&&!fits(scene,i,globalSupportPpm));
-  [attemptCeiling,candidateCeiling,nodeCeiling]=ceilings;
+  [attemptCeiling,candidateCeiling,nodeCeiling]=ceilings;replayingSupport=false;
   Object.assign(metrics,counters);timeLimitReached=reached;candidateClockTick=tick;
   supportVerdicts.set(i.raw.id,blocked);return blocked};
 const unpacked=remaining.map(i=>{
@@ -3933,7 +4161,7 @@ const status=unpacked.length?(timeLimitReached?'time_limit':'best_found'):'feasi
 const solverName=solverAlias?`${solverAlias}:javascript_fallback`:'javascript_fallback';
 const starts=[{id:solverName,started:true,completed:!timeLimitReached&&!effortLimitReached,truncated:timeLimitReached||effortLimitReached,selected:true,global_deadline_reached:timeLimitReached}],termination=aggregateTermination(starts);if(effortLimitReached&&!timeLimitReached)termination.code='effort_limit';
 const scoreValueForgone=remaining.reduce((sum,i)=>sum+(i.value??0),0);
-const defaultScore=[unpacked.length,containers.length,scoreCost,scoreUnused,scoreHeight],score=objective==='lowest_cost'?[defaultScore[0],defaultScore[2],defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='shipping_cost'?[defaultScore[0],exactTicks(scoreBillable),defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='lowest_landed_cost'?[defaultScore[0],scoreLanded,defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='open_dimension_height'?[defaultScore[0],scoreAchievedHeight,defaultScore[1],defaultScore[2],defaultScore[3]]:objective==='maximum_value'?[defaultScore[0],scoreValueForgone,defaultScore[1],defaultScore[2],defaultScore[3]]:byVolume?[unpackedVolumePpm(nominalVolume(remaining),requestedVolume),defaultScore[0],defaultScore[1],defaultScore[2],defaultScore[3]]:defaultScore;
+const defaultScore=[unpacked.length,containers.length,scoreCost,scoreUnused,scoreHeight],score=objective==='lowest_cost'?[defaultScore[0],defaultScore[2],defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='shipping_cost'?[defaultScore[0],exactTicks(scoreBillable),defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='lowest_landed_cost'?[defaultScore[0],reportedLanded(scoreLanded),defaultScore[1],defaultScore[3],defaultScore[4]]:objective==='open_dimension_height'?[defaultScore[0],scoreAchievedHeight,defaultScore[1],defaultScore[2],defaultScore[3]]:objective==='maximum_value'?[defaultScore[0],scoreValueForgone,defaultScore[1],defaultScore[2],defaultScore[3]]:byVolume?[unpackedVolumePpm(nominalVolume(remaining),requestedVolume),defaultScore[0],defaultScore[1],defaultScore[2],defaultScore[3]]:defaultScore;
 const result={status,feasibility:{code:complete?'feasible':'unknown'},termination,optimality:{code:complete?'not_proven':'best_found'},complete,objective,algorithm:{profile:req.configuration?.solver_profile??'balanced',solver:solverName,duration_ms:0,seed:req.configuration?.seed??42,time_limit_reached:timeLimitReached,effort_limit_reached:effortLimitReached,candidates_evaluated:metrics.feasible_candidates,placements_attempted:metrics.orientations_considered,metrics},summary:{container_count:containers.length,packed_item_count:items.length-unpacked.length,unpacked_item_count:unpacked.length},score,containers,unpacked_items:unpacked,catalog_versions_used:catalogVersionsUsed(req.catalog_versions_used),warnings:['JavaScript fallback is active; build the Rust addon for the native portfolio'],alternatives:[]};
 if(unpriceableDetail!=null)Object.defineProperty(result,'unpriceableDetail',{value:unpriceableDetail,enumerable:false,writable:false,configurable:true});
 return finalizeOutermost(result)}
@@ -3966,13 +4194,13 @@ function rebalanceContext(req,result){
   }
   const templates=new Map((req.containers??[]).map(raw=>{
     const declared=dims(raw.inner_dimensions,unit),limit=raw.pallet_overhang_limit;
-    const frame=limit==null?null:solvingFrame(declared,scalar(limit.length,unit,LEN),scalar(limit.width,unit,LEN)),d=frame===null?declared:frame.d;
+    const girth=bagGirth(raw.deformable_boundary,declared,value=>scalar(value,unit,LEN));
+    const frame=limit==null?null:solvingFrame(declared,scalar(limit.length,unit,LEN),scalar(limit.width,unit,LEN)),d=frame!==null?frame.d:girth?.standing?standingFrame(declared):declared;
     const axleSpec=raw.axles==null?null:raw.axles.map(axle=>({
       position:scalar(axle.position,unit,LEN),
       max:axle.max_load==null?null:scalar(axle.max_load,'g',WT),
     }));
-    const template={...raw,d,outerD:raw.outer_dimensions?dims(raw.outer_dimensions,unit):declared,deck:frame===null?null:frame.deck,bag:raw.deformable_boundary!=null,
-      gusset:raw.deformable_boundary?.side_gusset_depth==null?0:scalar(raw.deformable_boundary.side_gusset_depth,unit,LEN),
+    const template={...raw,d,outerD:raw.outer_dimensions?dims(raw.outer_dimensions,unit):declared,deck:frame===null?null:frame.deck,bag:girth!==null,girth,
       max:raw.max_payload==null?null:scalar(raw.max_payload,'g',WT),
       tare:scalar(raw.tare_weight??0,'g',WT),axleSpec,
       reservePpm:scaledRatio(raw.void_fill_reserve_ratio??0),
@@ -4072,14 +4300,14 @@ function publicRebalancedContainers(req,context){
     const used=usedVolume(state.placements),reaction=axleReactions(state.tmpl,state.placements);
     const container={...state.publicContainer,payload_weight:outWeight(payload,outputWeight),
       gross_weight:outWeight(payload+state.tmpl.tare,outputWeight),used_volume_ticks3:used.toString(),
-      volume_utilization:sixPlaces(used,volume(state.tmpl.d)),
+      volume_utilization:ratioPlaces(used,volume(state.tmpl.d)),
       centre_of_mass_offset_ppm:centreOfMassOffsetPpm(state.tmpl,state.placements,context.clear),
       placements:state.placements.map((placement,index)=>({...placement.publicPlacement,
         // A moved item's id names where it now is, in the container it now sits in (1.10).
         placement_id:placementId(state.publicContainer.id,[placement.x+context.clear,placement.y+context.clear,placement.z+context.clear],placement.item.raw.id,placement.r),
         position:outPoint({x:placement.x+context.clear,y:placement.y+context.clear,z:placement.z+context.clear},outputLength),
         dimensions:outDims(placement.pd,outputLength),orientation:placement.r,
-        support_ratio:sixPlaces(...supportFraction(placement,state.placements,null,state.tmpl.deck)),
+        support_ratio:ratioPlaces(...supportFraction(placement,state.placements,null,state.tmpl.deck)),
         top_load:outWeight(loads[index],outputWeight),
       })),
     };
@@ -4150,9 +4378,10 @@ export function rebalanceWeight(req,result,{maxMoves=64}={}){
         const projected=[...weights];projected[sourceIndex]-=weight;projected[destinationIndex]+=weight;
         if(projected.reduce(heavier)-projected.reduce(lighter)>=spread)continue;
         for(const [x,y,z] of rebalanceCandidatePoints(context.states[destinationIndex])){
-          const trial=cloneValue(context.states);
-          const [relocated]=trial[sourceIndex].placements.splice(placementIndex,1);
-          relocated.x=x;relocated.y=y;relocated.z=z;trial[destinationIndex].placements.push(relocated);
+          // Only the two states' placement lists and the moved placement change; everything else is read-only here.
+          const trial=context.states.map((state,index)=>index===sourceIndex||index===destinationIndex?{...state,placements:[...state.placements]}:state);
+          const [original]=trial[sourceIndex].placements.splice(placementIndex,1);
+          trial[destinationIndex].placements.push({...original,x,y,z});
           const originalStates=context.states;context.states=trial;
           if(rebalanceValid(context,result)&&(statesPriceable==null||statesPriceable())){
             committed={item_id:moving.item.id,from_container_id:originalStates[sourceIndex].publicContainer.id,to_container_id:originalStates[destinationIndex].publicContainer.id};

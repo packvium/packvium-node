@@ -238,10 +238,19 @@ function stockBox(request, machine, stockId, inner) {
     quantity: 1,
     inner_dimensions: tickBox(inner),
     outer_dimensions: tickBox(outer),
-    cost_minor: Number(BigInt(stockInteger(get(machine, 'cost_minor'), 'cost_minor')) + perSquareMetre(price, area)),
+    cost_minor: safeCost(BigInt(stockInteger(get(machine, 'cost_minor'), 'cost_minor')) + perSquareMetre(price, area)),
     tare_weight: { value: String(BigInt(declaredTare) + perSquareMetre(tareRate, area)), unit: 'ticks' },
   });
   return box;
+}
+
+/** C-13: the exact cost as a `Number`, or a refusal in the wording of the admission rule; a cut box larger than its machine's own declared size can pass 2^53 - 1, and rounding would price it wrongly. */
+function safeCost(cost) {
+  if (cost > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new PlanRevisionError('invalid_revision',
+      `a made-to-measure container's cost_per_square_metre_minor prices the largest box above ${Number.MAX_SAFE_INTEGER}`);
+  }
+  return Number(cost);
 }
 
 function stockObject(value, name, optional = false) {

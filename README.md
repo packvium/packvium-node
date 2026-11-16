@@ -1,14 +1,12 @@
 # @packvium/engine
 
-Deterministic 3D cartonization for Node.js. It uses the optional native engine when
-available and automatically falls back to the bundled JavaScript implementation.
+Deterministic 3D bin packing and cartonization for Node.js, with TypeScript declarations
+and no dependencies. It runs a bundled JavaScript engine, and a compiled native engine
+instead when one is built beside it.
 
 Use it to pick the smallest carton for an order, build a pallet, load a shipping container,
 or load a truck within its axle ratings and delivery-stop order. Every answer comes back as
 coordinates and rotations for each item, with a reason for anything that did not fit.
-
-Full documentation, the constraint reference and benchmarks live at
-[packvium.com](https://packvium.com).
 
 ## Install
 
@@ -28,7 +26,7 @@ const result = pack({
   units: { length: 'mm' },
   configuration: {
     // Stop by counted work, not by the clock, so the answer is the same on any machine.
-    // The time limit is only a safety fuse; see "Deterministic results" below.
+    // The time limit is only a safety fuse; see "Getting the same answer every time" below.
     effort_budget: { max_candidates_evaluated: 1000000 },
     time_limit_ms: 60000,
   },
@@ -63,60 +61,33 @@ console.log(quote.quote.total_minor);
 
 Lengths and weights are strings on purpose: they are parsed into exact integers, so `'0.1'`
 is a tenth of a millimetre and never `0.09999999999999999`. Every measurement in the result
-comes back as `{ ticks, value, unit }` -- `ticks` is the exact integer the engine reasoned
+comes back as `{ ticks, value, unit }`: `ticks` is the exact integer the engine reasoned
 with, `value` the same number written for a person.
 
-Support is not required by default: `minimum_support_ratio` is 0, so an item may rest on
-nothing above the container floor, and the result then says so in `warnings`
-(`unsupported_placements: N placement(s) rest on nothing above the container floor; ...`).
-To require support, set it above 0 — `configuration: { minimum_support_ratio: 0.75 }` for three quarters of the base.
+## Using it in your project
 
-## Two backends
+Two examples are written the way application code is written, with your own product and
+order records on one side and the library call in the middle. `pack` is synchronous and
+takes a plain object, so both drop into an Express handler, a Next.js server action or a
+queue worker. Start from the one closer to what you are building.
 
-`pack()` uses a compiled native addon when one is built beside `index.js` and loads,
-and the bundled JavaScript engine otherwise. The published package ships no binary, so an
-`npm install` runs the JavaScript engine. `backend()` says which one answered.
+| You are building | Start from | What it does |
+| --- | --- | --- |
+| A checkout or cart endpoint | [`checkout.mjs`](examples/checkout.mjs) | Maps a cart onto a request, picks the cheapest cartons, and reads the parcels back for the page. Two functions hold everything Packvium-specific. |
+| A warehouse or fulfilment job | [`fulfilment.mjs`](examples/fulfilment.mjs) | Runs an order from paid to labelled: a shipping rule picks the carrier service, the order is packed under its constraints, `validate` checks the plan, and every parcel is priced from a pinned tariff. |
+| An HTTP endpoint that packs | [`errors.mjs`](examples/errors.mjs) | Shows what each kind of refused request throws, and which fields to branch on. |
+| A dock or driver screen | [`execution.mjs`](examples/execution.mjs), [`trucking.mjs`](examples/trucking.mjs) | Turns a result into numbered loading steps, and loads a van by stop and axle rating. |
 
-- **Packing:** both return a valid packing that honours every rule in the request, and each is
-  deterministic on its own. They are independent searches, so for the same request they may
-  choose a different arrangement, a different container, or a differently worded reason for an
-  item left out. Do not compare results across backends byte for byte.
-- **Commerce:** the two are held to the same answer: a quote's price is one exact integer
-  and both compute the same one, and an unanswerable request is rejected by both with the same
-  code and fields.
+Rules that most projects need on day one:
 
-## Deterministic results
-
-A solve stops when it finishes or when a limit stops it, and which limit matters:
-
-- `configuration.time_limit_ms` is a wall clock. How far a search gets in it depends on the
-  machine and its load, so an answer the clock cut short can differ on the next run. The
-  JavaScript engine uses **1000 ms** when you set nothing.
-- `configuration.effort_budget` counts work -- `max_candidates_evaluated`,
-  `max_placement_attempts`, `max_search_nodes`, `max_restarts` -- and stops at the same point
-  on every machine, so even a partial answer repeats exactly.
-
-For anything you store, compare or audit, set an `effort_budget` and a `time_limit_ms` far above
-what that work takes, as a fuse rather than a limit. The result says which one stopped it:
-
-```js
-const result = pack({ ...request, configuration: {
-  effort_budget: { max_candidates_evaluated: 200000 },
-  time_limit_ms: 60000,
-} });
-
-result.termination.code;               // "complete", "effort_limit" or "time_limit"
-result.algorithm.effort_limit_reached; // true: partial, but a rerun gives the same answer
-result.algorithm.time_limit_reached;   // true: the clock decided -- do not cache it as the answer
-```
-
-Items the search never reached are listed in `unpacked_items` with reason `effort_limit` or
-`time_limit`, not as items that do not fit. [`examples/reproducibility.mjs`](examples/reproducibility.mjs)
-shows both.
-
-`effort_limit` means the budget stopped work the search still had: a search that finishes on
-exactly its budget reads `complete`, and `termination.any_start_truncated` says whether the
-budget cut a start that might have won.
+- An item that does not fit is not an error. The result lists it in `unpacked_items` with a
+  reason, and everything else is still packed.
+- Support is not required by default: `minimum_support_ratio` is 0, so an item may rest on
+  nothing above the container floor, and the result then says so in `warnings`
+  (`unsupported_placements: N placement(s) rest on nothing above the container floor; ...`).
+  To require support, set it above 0: `configuration: { minimum_support_ratio: 0.75 }` for three quarters of the base.
+- Set an `effort_budget` for any answer you store or show twice. See
+  [Getting the same answer every time](#getting-the-same-answer-every-time).
 
 ## Errors
 
@@ -153,7 +124,7 @@ every Packvium engine. Branch on `reason` and `field`; show the message to a per
   `container.pallet_overhang_limit+axles`. It is refused rather than silently ignored.
 - Numbers are judged by value, as the other engines judge them: `2.0` is the integer `2`, `2.5`
   and `'2'` are not integers, and an integer above `Number.MAX_SAFE_INTEGER` (2^53 - 1) is
-  `above_maximum` -- also when it arrives as JSON text, which `JSON.parse` would otherwise round.
+  `above_maximum`, also when it arrives as JSON text, which `JSON.parse` would otherwise round.
 - Text that is not JSON makes `packJson()` throw the `SyntaxError` from `JSON.parse`.
 
 A request that is valid but does not fit completely is not an error: the result lists what was
@@ -182,9 +153,56 @@ const issues = validate(request, pack(request)); // [] -- valid
 It judges any engine's result, not only this package's. A result without the documented shape
 throws `MalformedResult`, whose `kind` is `contract` or `shape`.
 
+## Getting the same answer every time
+
+A solve stops when it finishes or when a limit stops it, and which limit matters:
+
+- `configuration.time_limit_ms` is a wall clock. How far a search gets in it depends on the
+  machine and its load, so an answer the clock cut short can differ on the next run. The
+  JavaScript engine uses **1000 ms** when you set nothing.
+- `configuration.effort_budget` counts work (`max_candidates_evaluated`,
+  `max_placement_attempts`, `max_search_nodes`, `max_restarts`) and stops at the same point
+  on every machine, so even a partial answer repeats exactly.
+
+For anything you store, compare or audit, set an `effort_budget` and a `time_limit_ms` far above
+what that work takes, as a fuse rather than a limit. The result says which one stopped it:
+
+```js
+const result = pack({ ...request, configuration: {
+  effort_budget: { max_candidates_evaluated: 200000 },
+  time_limit_ms: 60000,
+} });
+
+result.termination.code;               // "complete", "effort_limit" or "time_limit"
+result.algorithm.effort_limit_reached; // true: partial, but a rerun gives the same answer
+result.algorithm.time_limit_reached;   // true: the clock decided -- do not cache it as the answer
+```
+
+Items the search never reached are listed in `unpacked_items` with reason `effort_limit` or
+`time_limit`, not as items that do not fit. [`examples/reproducibility.mjs`](examples/reproducibility.mjs)
+shows both.
+
+`effort_limit` means the budget stopped work the search still had: a search that finishes on
+exactly its budget reads `complete`, and `termination.any_start_truncated` says whether the
+budget cut a start that might have won.
+
+## Two backends
+
+`pack()` uses a compiled native addon when one is built beside `index.js` and loads,
+and the bundled JavaScript engine otherwise. The published package ships no binary, so an
+`npm install` runs the JavaScript engine. `backend()` says which one answered.
+
+- **Packing:** both return a valid packing that honours every rule in the request, and each is
+  deterministic on its own. They are independent searches, so for the same request they may
+  choose a different arrangement, a different container, or a differently worded reason for an
+  item left out. Do not compare results across backends byte for byte.
+- **Commerce:** the two are held to the same answer: a quote's price is one exact integer
+  and both compute the same one, and an unanswerable request is rejected by both with the same
+  code and fields.
+
 ## Quotes, policy and catalog versions
 
-`commerce` has three functions, all deterministic and all over one document you supply —
+`commerce` has three functions, all deterministic and all over one document you supply:
 no clock, no network, no hidden state. A history is a list and a version's number is its
 position in that list starting at 1, so `tariff_version: 2` always means "the second
 entry under this carrier and service".
@@ -217,44 +235,15 @@ commerce.canonicalJson(result);
 Two kinds of failure, and they are not interchangeable:
 
 - a **malformed** document or request is your bug and throws `CommerceInputError`;
-- a request the model simply **cannot answer** — no tariff effective at that instant, no
-  rate for that zone — is a successful call returning `"status": "rejected"` with a code
+- a request the model **cannot answer** (no tariff effective at that instant, no
+  rate for that zone) is a successful call returning `"status": "rejected"` with a code
   from a closed set and structured fields naming what was missing.
 
 `commerce.backend()` reports whether the native addon or the JavaScript implementation
 answered; both give the same price and the same rejection for the same input. A runnable
 walk-through of all three functions is in [examples/commerce.mjs](examples/commerce.mjs), and
-the full contract — document format, every result shape, all ten rejection codes, complexity
-and limitations — is [COMMERCE-API.md](https://github.com/toxakara/packvium-node/blob/main/docs/COMMERCE-API.md).
-
-## Examples
-
-Runnable, in [`examples/`](examples). Each one is a single file you can read top to bottom
-and execute without a project around it, and each prints what it teaches.
-
-| File | What it shows |
-| --- | --- |
-| [`basic.mjs`](examples/basic.mjs) | Pack an order, read placements, and see why an item was refused. |
-| [`objectives.mjs`](examples/objectives.mjs) | Six of the seven objectives (all but `maximum_volume`) on scenes where they genuinely disagree about which container to open, a declared `currency` echoed on the answer, and the `optimality.lower_bound` five of them state. |
-| [`constraints.mjs`](examples/constraints.mjs) | Rotations and `keep_upright`, support ratio, top load, stacking caps, incompatible tags and atomic groups — each with and without the rule — and `explainUnpackedItem` turning a refusal into a sentence. |
-| [`limits.mjs`](examples/limits.mjs) | Wheel arches as `obstacles` with `additional_boxes`, `max_items` and `tag_limits` per container, what happens when container stock or `max_containers` runs out, a crate overhanging its pallet under `pallet_overhang_limit`, and a flat bag against a gusseted one. |
-| [`trucking.mjs`](examples/trucking.mjs) | A multi-drop van: `stop_index` and a rear door in `access_directions`, two `axles` with load limits, and a safe loading order fed into `buildExecutionPlan`. |
-| [`shapes.mjs`](examples/shapes.mjs) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, two identical wedges that need one of the 18 signed rotations to share it, and a cushion that compresses under load until the crush limit refuses it. |
-| [`units.mjs`](examples/units.mjs) | Why lengths travel as strings: fractional inches kept exact, one tick deciding a fit, and the point where a JavaScript number stops being exact and a quote is refused rather than rounded. |
-| [`serialization.mjs`](examples/serialization.mjs) | `packJson` with JSON text in and out, runners-up through `alternatives`, and exactly which mistakes are refused and which are ignored. |
-| [`reproducibility.mjs`](examples/reproducibility.mjs) | `effort_budget` against `time_limit_ms`: a budget that never binds, one that cuts the search short and still repeats exactly, and how to tell from the result which one stopped it. |
-| [`errors.mjs`](examples/errors.mjs) | `InvalidRequestError`'s `code`, `reason`, `field` and message for each kind of bad request, JavaScript's integer range, `FixedPlacementError` and `UnsupportedFeatureError` — and a valid request that simply does not fit. |
-| [`fixed_placements.mjs`](examples/fixed_placements.mjs) | Pack around items already loaded, lock half of an earlier plan by quoting its placements and their `placement_id`, a fixed set that cannot hold, and an id that names another placement. |
-| [`rebalancing.mjs`](examples/rebalancing.mjs) | `rebalanceWeight` evening out payload between packed crates, the moves it made, and `maxMoves`. |
-| [`commerce.mjs`](examples/commerce.mjs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
-| [`execution.mjs`](examples/execution.mjs) | Turn a result into dock instructions, and what "byte-identical" does and does not promise: the four adapters agree on any given result, while this engine is free to reach a different packing than Python does. |
-| [`artifacts.mjs`](examples/artifacts.mjs) | Hand a result to a system with no engine: one document with the plan, geometry and the request that produced it, exported as CSV and a printable HTML work order, and a refusal for a format it does not know. |
-| [`revisions.mjs`](examples/revisions.mjs) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, a hash-chained record that notices an edit, and a box cut to measure (with a void-fill reserve) that a revision turns into stock. |
-| [`nested.mjs`](examples/nested.mjs) | `packNested`: cartons, then a pallet, and the carton set the greedy chain picks against the one `levelBeamWidth: 2` finds the pallet can take. |
-
-```bash
-node examples/basic.mjs
-```
+the full contract (document format, every result shape, all ten rejection codes, complexity
+and limitations) is [COMMERCE-API.md](https://github.com/packvium/packvium-node/blob/main/docs/COMMERCE-API.md).
 
 ## Subpath modules
 
@@ -280,7 +269,38 @@ returns them all; `artifactToScene(artifact, index)` reads one from an operation
 loading sequence when the artifact's plan carries one. `sceneItemId(reference)` spells a plan
 step's placement the way its scene item is named, to match one to the other.
 
-## Features
+## Examples
+
+Runnable, in [`examples/`](examples). Each one is a single file you can read top to bottom
+and execute without a project around it, and each prints what it teaches.
+
+| File | What it shows |
+| --- | --- |
+| [`checkout.mjs`](examples/checkout.mjs) | A shop's checkout: a cart mapped onto a request and the parcels read back, with the cheapest cartons chosen. |
+| [`fulfilment.mjs`](examples/fulfilment.mjs) | An order from paid to labelled: a policy rule picks the service, the order is packed under its constraints, `validate` checks the plan, and each parcel is priced from a pinned tariff. |
+| [`basic.mjs`](examples/basic.mjs) | Pack an order, read placements, and see why an item was refused. |
+| [`objectives.mjs`](examples/objectives.mjs) | Six of the seven objectives (all but `maximum_volume`) on scenes where they disagree about which container to open, a declared `currency` echoed on the answer, and the `optimality.lower_bound` five of them state. |
+| [`constraints.mjs`](examples/constraints.mjs) | Rotations and `keep_upright`, support ratio, top load, stacking caps, incompatible tags and atomic groups, each with and without the rule, and `explainUnpackedItem` turning a refusal into a sentence. |
+| [`limits.mjs`](examples/limits.mjs) | Wheel arches as `obstacles` with `additional_boxes`, `max_items` and `tag_limits` per container, what happens when container stock or `max_containers` runs out, a crate overhanging its pallet under `pallet_overhang_limit`, and a flat bag against a gusseted one. |
+| [`trucking.mjs`](examples/trucking.mjs) | A multi-drop van: `stop_index` and a rear door in `access_directions`, two `axles` with load limits, and a safe loading order fed into `buildExecutionPlan`. |
+| [`shapes.mjs`](examples/shapes.mjs) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, two identical wedges that need one of the 18 signed rotations to share it, and a cushion that compresses under load until the crush limit refuses it. |
+| [`units.mjs`](examples/units.mjs) | Why lengths travel as strings: fractional inches kept exact, one tick deciding a fit, and the point where a JavaScript number stops being exact and a quote is refused rather than rounded. |
+| [`serialization.mjs`](examples/serialization.mjs) | `packJson` with JSON text in and out, runners-up through `alternatives`, and exactly which mistakes are refused and which are ignored. |
+| [`reproducibility.mjs`](examples/reproducibility.mjs) | `effort_budget` against `time_limit_ms`: a budget that never binds, one that cuts the search short and still repeats exactly, and how to tell from the result which one stopped it. |
+| [`errors.mjs`](examples/errors.mjs) | `InvalidRequestError`'s `code`, `reason`, `field` and message for each kind of bad request, JavaScript's integer range, `FixedPlacementError` and `UnsupportedFeatureError`, and a valid request that does not fit. |
+| [`fixed_placements.mjs`](examples/fixed_placements.mjs) | Pack around items already loaded, lock half of an earlier plan by quoting its placements and their `placement_id`, a fixed set that cannot hold, and an id that names another placement. |
+| [`rebalancing.mjs`](examples/rebalancing.mjs) | `rebalanceWeight` evening out payload between packed crates, the moves it made, and `maxMoves`. |
+| [`commerce.mjs`](examples/commerce.mjs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
+| [`execution.mjs`](examples/execution.mjs) | Turn a result into dock instructions, and what "byte-identical" does and does not promise: the four adapters agree on any given result, while this engine is free to reach a different packing than Python does. |
+| [`artifacts.mjs`](examples/artifacts.mjs) | Hand a result to a system with no engine: one document with the plan, geometry and the request that produced it, exported as CSV and a printable HTML work order, and a refusal for a format it does not know. |
+| [`revisions.mjs`](examples/revisions.mjs) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, a hash-chained record that notices an edit, and a box cut to measure (with a void-fill reserve) that a revision turns into stock. |
+| [`nested.mjs`](examples/nested.mjs) | `packNested`: cartons, then a pallet, and the carton set the greedy chain picks against the one `levelBeamWidth: 2` finds the pallet can take. |
+
+```bash
+node examples/basic.mjs
+```
+
+## What it covers
 
 - Exact, deterministic placement with no floating-point geometry decisions.
 - Rotation, payload, stackability, support, clearance, obstacle and tag constraints; a
@@ -307,7 +327,7 @@ step's placement the way its scene item is named, to match one to the other.
 - Execution plans through `buildExecutionPlan()` / `canonicalPlanJson()`: a work-order view of a
   result, with solver facts separated from the text that cites them.
 - Portable operational artifacts through `buildOperationalArtifact()` from `artifacts.js`, exported
-  by `artifact-exports.js` as canonical JSON, CSV or a self-contained HTML work order — the same
+  by `artifact-exports.js` as canonical JSON, CSV or a self-contained HTML work order, the same
   bytes the Python, PHP and Rust packages write.
 - Fixed placements (`fixed_placements`): items already loaded stay where they are and the solve
   packs around them; plan revisions from `revisions.js` record exceptions against an approved
@@ -318,6 +338,22 @@ step's placement the way its scene item is named, to match one to the other.
 The native addon is optional. `npm install` works on unsupported platforms too; call
 `backend()` if your application needs to know which implementation handled a request.
 
+## Documentation
+
+TypeScript declarations are included. See the package's `index.d.ts` for the complete
+request and result types. The documentation is in the source repository, not in the npm
+package:
+
+- [GUARANTEES.md](https://github.com/packvium/packvium-node/blob/main/docs/GUARANTEES.md): what is promised and what is not;
+- [PUBLIC-API.md](https://github.com/packvium/packvium-node/blob/main/docs/PUBLIC-API.md): every request field, result shape and status;
+- [UNITS-AND-NUMERICS.md](https://github.com/packvium/packvium-node/blob/main/docs/UNITS-AND-NUMERICS.md): units, accepted input forms, exact
+  arithmetic and the 2^53 ceiling;
+- [COMMERCE-API.md](https://github.com/packvium/packvium-node/blob/main/docs/COMMERCE-API.md): the commercial/control-plane contract.
+
+Report security issues through [SECURITY.md](SECURITY.md).
+
+The constraint reference and the benchmarks are at [packvium.com](https://packvium.com).
+
 ## The Packvium family
 
 One request and result contract, implemented independently in four engines (Rust,
@@ -326,45 +362,28 @@ PHP to identical placements, Rust and JavaScript to a valid packing that scores 
 than a per-fixture floor.
 Pick the package for your stack; mixing them in one system is safe.
 
-Documentation, the constraint reference and the benchmarks are at
-[packvium.com](https://packvium.com).
-
 | Package | Install | Source |
 | --- | --- | --- |
-| Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
-| PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.10"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
-| Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
-| Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
-| PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
-| Python native selector — `packvium-native` | from source until the native wheels ship | [packvium-python-adapter](https://github.com/toxakara/packvium-python-adapter) |
-
-## API and support
-
-TypeScript declarations are included. See the package's `index.d.ts` for the complete
-request and result types. The documentation is in the source repository, not in the npm
-package:
-
-- [GUARANTEES.md](https://github.com/toxakara/packvium-node/blob/main/docs/GUARANTEES.md) — what is promised and what is not;
-- [PUBLIC-API.md](https://github.com/toxakara/packvium-node/blob/main/docs/PUBLIC-API.md) — every request field, result shape and status;
-- [UNITS-AND-NUMERICS.md](https://github.com/toxakara/packvium-node/blob/main/docs/UNITS-AND-NUMERICS.md) — units, accepted input forms, exact
-  arithmetic and the 2^53 ceiling;
-- [COMMERCE-API.md](https://github.com/toxakara/packvium-node/blob/main/docs/COMMERCE-API.md) — the commercial/control-plane contract.
-
-Report security issues through [SECURITY.md](SECURITY.md).
+| Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/packvium/packvium-python) |
+| PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/packvium/packvium-php) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.11"` | [packvium-rust](https://github.com/packvium/packvium-rust) |
+| Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/packvium/packvium-node) |
+| Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/packvium/packvium-wasm) |
+| PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/packvium/packvium-php-bridge) |
+| Python native selector — `packvium-native` | from source until the native wheels ship | [packvium-python-adapter](https://github.com/packvium/packvium-python-adapter) |
 
 ## Citation
 
 If Packvium supports your research, cite it as software. GitHub's **Cite this repository**
-button reads [`CITATION.cff`](https://github.com/toxakara/packvium-node/blob/main/CITATION.cff), and
-[`codemeta.json`](https://github.com/toxakara/packvium-node/blob/main/codemeta.json) carries the same record in
+button reads [`CITATION.cff`](https://github.com/packvium/packvium-node/blob/main/CITATION.cff), and
+[`codemeta.json`](https://github.com/packvium/packvium-node/blob/main/codemeta.json) carries the same record in
 CodeMeta form.
 
 ```bibtex
 @software{packvium_node,
   author  = {{Packvium contributors}},
   title   = {Packvium for Node.js},
-  version = {1.10.0},
+  version = {1.11.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

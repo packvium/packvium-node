@@ -4,6 +4,46 @@ What changed in `@packvium/engine` on npm, release by release. The format follow
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0]
+
+Bottom gussets and standing pouches, a certified bound for the shipping objectives, one money
+ceiling, and one measure grammar.
+
+### Added
+
+- **`deformable_boundary: { kind: 'gusseted_bag', bottom_gusset_depth, orientation }`**: a bottom
+  gusset lengthens the girth along the bag, and `orientation: 'standing'` packs a stand-up pouch
+  upright.
+- **`optimality.lower_bound` and the gap under `shipping_cost` and `lowest_landed_cost`**;
+  `validate` checks them.
+- **`examples/checkout.mjs` and `examples/fulfilment.mjs`.**
+
+### Changed
+
+- **A `rate_table` priced above 9007199254740991 minor units** at its top bracket, surcharge
+  included, is `invalid_request` / `above_maximum`. The fallback's packing `score` no longer
+  carries a rounded double past 2^53. Commerce refuses an input integer above 2^53 − 1 with
+  `expected an exact integer`, since `JSON.parse` has already rounded it.
+- **Measures follow the shared grammar:** `100.`, `.5`, `0x64` and `100 millimeters` are
+  `wrong_type`, and `"5 /2"` is five halves, not 5. `hull_vertices` holds at most 32 points.
+- **Two equally ranked container types open in code-point order of their ids,** not request
+  order, as in every other engine. Item types in the block solver, policy citations and
+  validation text follow code-point order, not UTF-16 order.
+- **`volume_utilization` and `support_ratio` print six places of the correctly rounded double,**
+  as the other engines do.
+- **The "why unpacked" reason no longer reads the search deadline.**
+
+### Fixed
+
+- **`quality` crashed with two payload-limited container types** ("Cannot convert a BigInt value
+  to a number"). This is also in 1.10.0.
+- **A `single` ground contact was checked in `O(n + kn)` per candidate;** it is now `O(b)` for the
+  placements on one plane, with the same answers.
+- **A rate table of 125,000 brackets overflowed the stack.**
+- **`rebalanceWeight` deep-copied the scene for every trial move:** 120 items with 4 moves take
+  0.4 s instead of 21.8 s.
+- **The validator threw on `1e999`.**
+
 ## [1.10.0]
 
 Nested packing, overhanging pallets, gusseted bags, 24 rotations for a hull, a declared currency

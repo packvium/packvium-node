@@ -5,7 +5,8 @@ import test from 'node:test';
 import {
   Deadline, SequenceReplayError, UNSUPPORTED_FIELDS, UnsupportedFeatureError,
   BoundOverflowError, __spatialIndexForTests, __inspectHullShapeForTests, __objectiveBoundsForTests,
-  __objectiveVectorForTests, __requestBoundForTests, __runSmallestUnsortedForTests,
+  __objectiveVectorForTests, __requestBoundForTests, __runSmallestUnsortedForTests, __fractionalCoverForTests,
+  __billedWeightBoundForTests,
   __occupiesLessThanItsBoxForTests, __candidatePrefixForTests, __groupBatchesForTests, aggregateTermination,
   InvalidRequestError, explainUnpackedItem, explanationForUnpackedItem, packFallback, rebalanceWeight,
   verifyLoadingPrefixBusinessRules, __ratiosForTests, __planBeamForTests,
@@ -1570,6 +1571,16 @@ test('a weight the tariff does not price is never reported as an answer', () => 
   );
 });
 
+test('a container landing exactly at 9007199254740991 is priced, not mistaken for unpriceable', () => {
+  const result = packFallback(landed({ weight_brackets_g: [5000], prices_minor: [9007199254740991] }, '200 g'));
+  assert.equal(result.score[1], 9007199254740991);
+  assert.equal(result.status, 'feasible');
+  assert.throws(
+    () => packFallback(landed({ weight_brackets_g: [500], prices_minor: [9007199254740991] }, '200 g')),
+    /above its rate table's last bracket \(500 g\); the shipment has no published price/,
+  );
+});
+
 test('an unpriceable container loses to a priceable one in the general greedy path', () => {
   // Eight units is past the single-item shape the compact path takes, and `try_grid`
   // stands down for this objective anyway, so this lands in the general per-round key.
@@ -2189,6 +2200,19 @@ test('the objective lower bound matches Python on every corpus case', (t) => {
     }
     assertObjectives(edge, instances, containers, edge.name);
   }
+  // The billed objectives need each type's tare, dimensional floor and priced
+  // brackets as well, so they are recorded apart, with `null` where the bound is withheld.
+  assert.ok(scene.billed.length > 0, 'a billed section that quietly emptied itself would be vacuous');
+  for (const one of scene.billed) {
+    const containers = containersOf(one).map((container, index) => ({
+      ...container, tare: BigInt(one.containers[index].tare), dimensional: BigInt(one.containers[index].dimensional),
+      brackets: one.containers[index].brackets.map(([bound, charge]) => [BigInt(bound), charge === null ? null : BigInt(charge)]),
+    }));
+    const name = one.fixture ?? one.name;
+    assert.deepEqual(__objectiveBoundsForTests(instancesOf(one), containers), one.bounds, `bounds diverge on ${name}`);
+    assert.deepEqual(__objectiveVectorForTests(instancesOf(one), containers, one.objective), one.vector,
+      `${one.objective} diverges from Python on ${name}`);
+  }
 });
 
 test('the request bound is read from the request itself, in the objective\'s own order', () => {
@@ -2217,9 +2241,114 @@ test('a result states its bound, and attainment is the only route to optimal', (
   assert.equal(missed.optimality.absolute_gap,
     missed.score[missed.optimality.gap_key] - missed.optimality.lower_bound[missed.optimality.gap_key]);
 
-  const uncovered = packFallback(request([cube('c', 100)], [box('b', 300, 100, 100)],
-    { configuration: { objective: 'shipping_cost', dimensional_weight_divisor: 5000 } }));
-  assert.deepEqual(uncovered.optimality, { code: 'not_proven' });
+  // Every built-in objective is covered since, so the withheld case is a
+  // made-to-measure container (D13).
+  // A copy of the conformance fixture, so the test runs where the shared corpus is absent.
+  const madeToMeasure = new URL('./fixtures/feature-made-to-measure-dimensional-weight-on-outer.json', import.meta.url);
+  assert.deepEqual(packFallback(JSON.parse(readFileSync(madeToMeasure))).optimality, { code: 'not_proven' });
+});
+
+const GRAM = 8_000_000;
+const brick = (quantity, grams) => cube('brick', 100, { quantity, weight: `${grams} g` });
+const billed = (objective, containers, items) => request(items, containers, { configuration: {
+  objective, dimensional_weight_divisor: 5000, dimensional_weight_length_unit: 'cm',
+  dimensional_weight_weight_unit: 'kg', solver_profile: 'exact_small' } });
+
+test('a billed objective without its divisor gets no bound', () => {
+  // The billed key needs the configuration's divisor; the solver refuses such a
+  // request, and the bound path says nothing rather than inventing a divisor.
+  const pair = request([cube('i', 10, { quantity: 2 })], [box('box', 30, 30, 30)]);
+  for (const objective of ['shipping_cost', 'lowest_landed_cost']) {
+    assert.equal(__requestBoundForTests({ ...pair, configuration: { objective } }), null, objective);
+  }
+});
+
+test('shipping_cost bills at least the floor and at least tare plus payload', () => {
+  // A 200 x 100 x 100 mm box is 0.4 kg dimensional at 5000 cm/kg; two 1 kg bricks and a
+  // 300 g tare bill 2.3 kg actual, so the bound is the actual weight, and it is attained.
+  const result = packFallback(billed('shipping_cost', [box('box', 200, 100, 100, { tare_weight: '300 g' })], [brick(2, 1000)]));
+  assert.deepEqual(result.optimality.lower_bound.slice(0, 2), [0, 2300 * GRAM]);
+  assert.equal(result.status, 'optimal');
+  // A 400 mm cube is 12.8 kg dimensional, above one light brick.
+  const bulky = __requestBoundForTests(billed('shipping_cost', [box('bulky', 400, 400, 400)], [brick(1, 100)]));
+  assert.equal(bulky[1], 12_800 * GRAM);
+  // A bag is billed on the package its load makes, so its floor is the tare and payload alone.
+  const bag = __requestBoundForTests(billed('shipping_cost',
+    [box('bag', 400, 400, 400, { deformable_boundary: { kind: 'flat_bag' } })], [brick(1, 100)]));
+  assert.equal(bag[1], 100 * GRAM);
+});
+
+test('lowest_landed_cost sees that two bricks cannot share a bracket', () => {
+  // Two 1000 g bricks cannot share a 1500 g bracket, so two containers pay it twice: the item
+  // cover says 200, which the weight cover alone (134) and the count term (100) miss.
+  const result = packFallback(billed('lowest_landed_cost', [
+    box('snug-dear', 200, 100, 100, { rate_table: { weight_brackets_g: [20000], prices_minor: [5000] } }),
+    box('unit-cheap', 100, 100, 100, { rate_table: { weight_brackets_g: [1500], prices_minor: [100] } }),
+  ], [brick(2, 1000)]));
+  assert.deepEqual(result.optimality.lower_bound.slice(0, 2), [0, 200]);
+  assert.equal(result.score[1], 200);
+});
+
+test('lowest_landed_cost reads the cheapest bracket a floor can reach, priced as the rate table prices it', () => {
+  const g = 8_000_000n;
+  const one = [{ volume: 1n, weight: 1000n * g, shrinks: false, value: 0n }];
+  const type = (brackets, rest = {}) => ({ usable: 10n, inner: 10n, baseArea: 1n, height: 10n, payload: null,
+    maxItems: null, quantity: null, costMinor: 0n, tare: 0n, dimensional: 0n, brackets, ...rest });
+  // A promotional dip: the 2 kg bracket is dearer than the 5 kg one, and prices need not rise
+  // with weight, so a load billable in either is bounded by the cheaper.
+  assert.equal(__objectiveVectorForTests(one, [type([[2000n * g, 700n], [5000n * g, 400n]])], 'lowest_landed_cost')[1], 400);
+  // A floor above every bracket cannot be priced, and with nothing else to open no
+  // statement is made; an unpriced bracket offers nothing either.
+  assert.equal(__objectiveVectorForTests(one, [type([[5n, 100n]], { dimensional: 10n })], 'lowest_landed_cost'), null);
+  assert.equal(__objectiveVectorForTests(one, [type([[5000n * g, null]])], 'lowest_landed_cost'), null);
+  // `max(price, minimum)` then the surcharge rounded up: 300 + 26 and 900 + 77.
+  const priced = (prices) => __requestBoundForTests(billed('lowest_landed_cost', [box('c', 100, 100, 100, { rate_table: {
+    weight_brackets_g: [1000, 2000], prices_minor: prices, minimum_charge_minor: 300, fuel_surcharge_permille: 85 } })],
+  [brick(1, 1000)]))[1];
+  assert.equal(priced([100, 900]), 326);
+  assert.equal(priced([2000, 900]), 977);
+});
+
+test('the landed bound caps each bracket by payload, volume and max_items, and only counts placed instances', () => {
+  const g = 8_000_000n;
+  const three = [1n, 2n, 3n].map((grams) => ({ volume: 4n, weight: grams * 1000n * g, shrinks: false, value: 0n }));
+  const type = (rest) => ({ usable: 100n, inner: 100n, baseArea: 10n, height: 10n, payload: null, maxItems: null,
+    quantity: null, costMinor: 0n, tare: 0n, dimensional: 0n, brackets: [[10000n * g, 100n]], ...rest });
+  // Uncapped, one container carries all three: the count term, 100.
+  assert.equal(__objectiveVectorForTests(three, [type({})], 'lowest_landed_cost')[1], 100);
+  // One item per container: three are opened and the item cover pays three charges.
+  assert.equal(__objectiveVectorForTests(three, [type({ maxItems: 1n })], 'lowest_landed_cost')[1], 300);
+  // A 3 kg payload carries the two lightest, so the 6 kg placed weight needs two charges.
+  assert.equal(__objectiveVectorForTests(three, [type({ payload: 3000n * g })], 'lowest_landed_cost')[1], 200);
+  // Room for one 4-unit instance: three are needed.
+  assert.equal(__objectiveVectorForTests(three, [type({ usable: 4n })], 'lowest_landed_cost')[1], 300);
+  // An instance smaller than its box gives the volume no say.
+  const nested = three.map((instance) => ({ ...instance, shrinks: true }));
+  assert.equal(__objectiveVectorForTests(nested, [type({ usable: 4n })], 'lowest_landed_cost')[1], 100);
+  // The one cheap single-item container is taken whole, then the dear one covers the other
+  // two at two thirds of its charge: 10 + ceil(2 x 90 / 3).
+  const capped = type({ brackets: [[10000n * g, 10n]], quantity: 1n, maxItems: 1n });
+  assert.equal(__objectiveVectorForTests(three, [capped, type({ brackets: [[10000n * g, 90n]] })], 'lowest_landed_cost')[1], 70);
+  // Nothing placed costs nothing.
+  assert.deepEqual(__objectiveVectorForTests(three, [type({ quantity: 0n })], 'lowest_landed_cost').slice(0, 2), [3, 0]);
+});
+
+test('the fractional cover takes cost-per-unit order and rounds only once', () => {
+  // Greedy by cost per unit is exact for one covering constraint; inventory caps an offer.
+  assert.equal(__fractionalCoverForTests([[10n, 3n, null], [4n, 1n, null]], 7n), 24n);
+  assert.equal(__fractionalCoverForTests([[10n, 3n, 1n], [4n, 1n, null]], 7n), 26n);
+  assert.equal(__fractionalCoverForTests([[10n, 3n, 1n]], 7n), null);
+  assert.equal(__fractionalCoverForTests([[0n, 5n, null]], 7n), 0n);
+  assert.equal(__fractionalCoverForTests([[5n, 0n, null]], 0n), 0n);
+});
+
+test('the shipping bound is withheld without enough inventory to open', () => {
+  // `L0` keeps `L1` inside the inventory, so this is reached only directly, as Python tests it.
+  const one = { tare: 0n, dimensional: 5n, quantity: 1n };
+  assert.throws(() => __billedWeightBoundForTests([[1n, 2n]], [one], 2n, 2n), { name: 'BoundWithheld' });
+  // One opened container bills its floor, 5, above the two ticks it carries.
+  assert.equal(__billedWeightBoundForTests([[1n, 2n]], [one], 2n, 1n), 5n);
+  assert.equal(__billedWeightBoundForTests([[1n, 2n]], [one], 0n, 0n), 0n);
 });
 
 test('maximum_value, open_dimension_height and maximum_volume each bound their own key', () => {
@@ -3390,3 +3519,69 @@ test('multilayer quality beam search with diamond top_load and compressible item
   assert.deepEqual(validate(payload, result), []);
 });
 
+
+test('the block solver orders item types by code point, not UTF-16 unit (S-03)', () => {
+  // "Ａ" (U+FF21) sorts before an astral id by code point and after it by UTF-16 unit, so the
+  // renamed request ("a" < "b") must pack exactly like the one that uses the real ids.
+  const request = (first, second) => ({
+    units: { length: 'mm' },
+    configuration: {
+      solver_profile: 'quality', time_limit_ms: 300_000,
+      effort_budget: { max_candidates_evaluated: 1_000_000, max_placement_attempts: 1_000_000, max_search_nodes: 1_000_000 },
+    },
+    items: [
+      { id: first, quantity: 3, dimensions: { length: '40', width: '60', height: '50' } },
+      { id: second, quantity: 3, dimensions: { length: '40', width: '60', height: '50' } },
+    ],
+    containers: [{ id: 'c', quantity: 2, inner_dimensions: { length: '80', width: '80', height: '80' } }],
+  });
+  const outcome = (first, second) => {
+    const result = packFallback(request(first, second));
+    return [result.containers.flatMap(({ placements }) => placements.map((placement) => placement.item_id)),
+      result.unpacked_items.map((item) => item.item_id)];
+  };
+  const renamed = JSON.stringify(outcome('b', 'a')).replaceAll('b#', '\u{1F600}#').replaceAll('a#', '\uFF21#');
+  assert.equal(JSON.stringify(outcome('\u{1F600}', '\uFF21')), renamed);
+});
+
+test('two identical container types are opened in code-point order of their ids, as in the other engines', () => {
+  for (const profile of ['fast', 'quality']) {
+    for (const [listed, opened] of [[['9', '10'], '10'], [['1e1', '10'], '10'], [['\u{1F600}', '\uFF21'], '\uFF21']]) {
+      const result = packFallback({
+        configuration: { solver_profile: profile },
+        items: [{ id: 'cube', quantity: 1, dimensions: { length: '10', width: '10', height: '10' } }],
+        containers: listed.map((id) => ({ id, quantity: 1, inner_dimensions: { length: '20', width: '20', height: '20' } })),
+      });
+      assert.equal(result.containers[0].container_type, opened, `${profile}: ${listed.join(', ')}`);
+    }
+  }
+});
+
+test('rebalanceWeight trials leave the request and the packing it was given untouched (A-02)', () => {
+  const payload = request(
+    [
+      cube('heavy', 10, { weight: '500', priority: 2 }),
+      cube('light', 10, { weight: '100', priority: 1 }),
+      cube('alone', 10, { weight: '100' }),
+    ],
+    [box('box', 30, 10, 10, { quantity: 2, max_items: 2 })],
+  );
+  const original = packSound(payload);
+  const requestBefore = JSON.stringify(payload);
+  const resultBefore = JSON.stringify(original);
+  const first = rebalanceWeight(payload, original);
+  assert.equal(first.improved, true);
+  assert.equal(JSON.stringify(payload), requestBefore);
+  assert.equal(JSON.stringify(original), resultBefore);
+  assert.deepEqual(rebalanceWeight(payload, original), first);
+});
+
+test('the maximal-spaces ranking compares candidates field by field, not as a sum past 2^53 (S-08)', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const name = 'regression-kilometre-scale-deck-shares-its-weight-across-piers.json';
+  const request = JSON.parse(await readFile(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
+  request.configuration = { ...request.configuration, solvers: ['maximal_spaces'] };
+  const result = packFallback(request);
+  assert.equal(result.containers.length, 1);
+  assert.equal(result.unpacked_items.length, 0);
+});

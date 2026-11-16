@@ -1,0 +1,64 @@
+{
+  "configuration": {
+    "solver_profile": "balanced",
+    "time_limit_ms": 300000,
+    "minimum_support_ratio": 0.5,
+    "effort_budget": {
+      "max_candidates_evaluated": 1000000,
+      "max_placement_attempts": 1000000,
+      "max_search_nodes": 1000000
+    }
+  },
+  "items": [
+    {
+      "id": "deck",
+      "quantity": 1,
+      "dimensions": {
+        "length": "6000000000",
+        "width": "10",
+        "height": "10"
+      },
+      "weight": {
+        "value": "2999",
+        "unit": "g"
+      },
+      "allowed_rotations": [
+        "LWH"
+      ],
+      "max_top_load": {
+        "value": "0",
+        "unit": "g"
+      }
+    },
+    {
+      "id": "pier",
+      "quantity": 3,
+      "dimensions": {
+        "length": "2000000000",
+        "width": "10",
+        "height": "10"
+      },
+      "weight": {
+        "value": "1",
+        "unit": "kg"
+      },
+      "max_top_load": {
+        "value": "1000",
+        "unit": "g"
+      },
+      "allowed_rotations": [
+        "LWH"
+      ]
+    }
+  ],
+  "containers": [
+    {
+      "id": "valley",
+      "inner_dimensions": {
+        "length": "6000000000",
+        "width": "10",
+        "height": "20"
+      }
+    }
+  ]
+}
