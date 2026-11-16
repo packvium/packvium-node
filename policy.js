@@ -17,6 +17,8 @@
 
 // The shipment-scoped facts a rule may select on. Properties of the shipment rather
 // than of any item or container, which is why the request had nowhere to put them.
+import { compareCodePoints } from './commerce-model.js';
+
 const SHIPMENT_FACTS = ['facility', 'customer', 'carrier', 'service'];
 
 // Wire name -> the keys the form requires, in the order they are read. Exactly one may
@@ -67,7 +69,7 @@ function shipmentContext(raw, where) {
   for (const fact of SHIPMENT_FACTS) context[fact] = null;
   if (raw == null) return context;
   if (!isPlainObject(raw)) throw new PolicyError(`${where} must be an object`);
-  const unknown = Object.keys(raw).filter(key => !SHIPMENT_FACTS.includes(key)).sort();
+  const unknown = Object.keys(raw).filter(key => !SHIPMENT_FACTS.includes(key)).sort(compareCodePoints);
   if (unknown.length) throw new PolicyError(`${where} names unknown shipment facts: ${unknown.join(', ')}`);
   for (const [name, value] of Object.entries(raw)) {
     if (typeof value !== 'string' || !value) throw new PolicyError(`${where}.${name} must be a non-empty string`);
@@ -83,7 +85,7 @@ const satisfiedBy = (selector, shipment) =>
 function parseForm(name, raw, where) {
   if (!isPlainObject(raw)) throw new PolicyError(`${where} must be an object`);
   const keys = FORMS[name];
-  const unknown = Object.keys(raw).filter(key => !keys.includes(key)).sort();
+  const unknown = Object.keys(raw).filter(key => !keys.includes(key)).sort(compareCodePoints);
   if (unknown.length) throw new PolicyError(`${where} has unknown keys: ${unknown.join(', ')}`);
   const missing = keys.filter(key => !hasOwn(raw, key));
   if (missing.length) throw new PolicyError(`${where} is missing ${missing.join(', ')}`);
@@ -102,7 +104,7 @@ function parseRule(raw, index) {
   const named = Object.keys(FORMS).filter(name => hasOwn(raw, name));
   if (named.length !== 1) {
     throw new PolicyError(
-      `${where} must name exactly one rule form (${Object.keys(FORMS).sort().join(', ')}), not ${named.length}`);
+      `${where} must name exactly one rule form (${Object.keys(FORMS).sort(compareCodePoints).join(', ')}), not ${named.length}`);
   }
   if (typeof raw.id !== 'string' || !raw.id) throw new PolicyError(`${where}.id must be a non-empty string`);
   const version = integer(raw.version, `${where}.version`, 1);
@@ -140,14 +142,14 @@ function resolve(rules, asOf, shipment) {
   // one cited, so sorting here is what makes the citation deterministic. Ties go to the
   // lexicographically smallest id -- never to insertion order, which would make the
   // citation depend on the order the caller happened to write.
-  return [...latest.values()].sort((a, b) => b.priority - a.priority || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return [...latest.values()].sort((a, b) => b.priority - a.priority || compareCodePoints(a.id, b.id));
 }
 
 /** The rules that participate in one request, already resolved and ordered. */
 export function parsePolicy(raw) {
   if (raw == null) return [];
   if (!isPlainObject(raw)) throw new PolicyError('policy must be an object');
-  const unknown = Object.keys(raw).filter(key => !['as_of', 'shipment', 'rules'].includes(key)).sort();
+  const unknown = Object.keys(raw).filter(key => !['as_of', 'shipment', 'rules'].includes(key)).sort(compareCodePoints);
   if (unknown.length) throw new PolicyError(`policy has unknown keys: ${unknown.join(', ')}`);
   const declared = raw.rules ?? [];
   if (!Array.isArray(declared)) throw new PolicyError('policy.rules must be an array');

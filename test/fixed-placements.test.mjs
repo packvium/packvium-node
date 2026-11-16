@@ -337,6 +337,19 @@ for (const [name, items, container, placements] of LAWFUL) {
   });
 }
 
+// A fixed single-rule item is recounted exactly rather than trusted, so a searched
+// item is kept out from under its overhang just as under a searched one.
+test('a searched item never becomes the second supporter of a fixed single-contact item', () => {
+  const data = { items: [item('a', { quantity: 2, must_be_on_floor: true }), item('b', { quantity: 1, ground_contact_rule: 'single', dimensions: wide })],
+    containers: [room({ quantity: 1 })], fixed_placements: [at('a'), at('b', '0', '100')] };
+  const result = packFallback(data);
+  // Without the recount the floor slot under the overhang, x = 100, is the first one taken.
+  const underOverhang = result.containers.flatMap((container) => container.placements)
+    .filter((placement) => !placement.fixed && placement.position.x.value === '100' && placement.position.z.value === '0');
+  assert.deepEqual(underOverhang, []);
+  assert.deepEqual(validate(data, result), []);
+});
+
 test('the validator catches a moved fixed item', () => {
   const packed = packFallback(request());
   const moved = request({ placements: [fixed('0')] });

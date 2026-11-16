@@ -11,12 +11,14 @@
  */
 
 import {
-  at, getNull, getOr, int, isDict, strictInt, truthy,
+  at, getNull, getOr, int, isDict, list, pyInt, strictInt, text, truthy,
 } from './json.js';
 import { ceilDiv, floorDiv, max, min, pyMod, ratioPpm } from './num.js';
+import { dimensionalWeight } from './objective.js';
 import { issue } from './outcome.js';
 import { intList, pyRepr } from './pyfmt.js';
 import { SCORE_SCALE } from './stacking.js';
+import { TICKS_PER_GRAM } from './units.js';
 
 /**
  * Where each covered objective reads `(L0, L1, L2, L3, L4)` in its own score order, a name
@@ -28,7 +30,14 @@ const BOUND_ORDERS = new Map([
   ['maximum_value', [0, 'value_forgone', 1, 2, 3]],
   ['open_dimension_height', [0, 'achieved_height', 1, 2, 3]],
   ['maximum_volume', ['unpacked_volume_ppm', 0, 1, 2, 3]],
+  ['shipping_cost', [0, 'billed_weight', 1, 3, 4]],
+  ['lowest_landed_cost', [0, 'landed_charge', 1, 3, 4]],
 ]);
+
+/** The objectives whose own key is what a carrier bills. */
+const BILLED_BOUND_OBJECTIVES = ['shipping_cost', 'lowest_landed_cost'];
+const BILLED_KEYS = ['billed_weight', 'landed_charge'];
+const UNPRICEABLE = 'no priceable inventory carries a packing that attains the count bound';
 
 const MAX_BOUND_SUM = 10n ** 30n;
 const MAX_BOUND_VALUE = 2n ** 53n - 1n;
@@ -280,17 +289,106 @@ function objectiveTerm(name, values, volumes, shrinks, containers, unpacked) {
   return ceilDiv(max(0n, requested - capacity) * SCORE_SCALE, requested);
 }
 
+/** The `count` smallest of `{value repeated quantity}` from `[value, quantity]` pairs, summed; `null` if fewer exist. */
+function leastOfInventory(pairs, count) {
+  let total = 0n;
+  let remaining = count;
+  for (const [value, quantity] of pairs.slice().sort(ascending)) {
+    if (remaining <= 0n) break;
+    const taken = quantity === null ? remaining : min(quantity, remaining);
+    total += value * taken;
+    remaining -= taken;
+  }
+  return remaining > 0n ? null : total;
+}
+
+/**
+ * Least cost covering `need` from `[cost, capacity, quantity]` offers taken fractionally, rounded
+ * up; greedy by cost per unit is optimal for one covering constraint. Whole offers add whole
+ * costs, so the one fraction is the last offer's share, `cost × remaining / capacity`.
+ */
+function fractionalCover(offers, need) {
+  if (need <= 0n) return 0n;
+  const perUnit = (left, right) => {
+    const [lower, upper] = [left[0] * right[1], right[0] * left[1]];
+    return lower < upper ? -1 : lower > upper ? 1 : 0;
+  };
+  let remaining = need;
+  let whole = 0n;
+  for (const [cost, capacity, quantity] of offers.filter((offer) => offer[1] > 0n).sort(perUnit)) {
+    if (quantity === null || remaining <= capacity * quantity) return ceilDiv(whole * capacity + cost * remaining, capacity);
+    whole += cost * quantity;
+    remaining -= capacity * quantity;
+  }
+  return null;
+}
+
+/** `shipping_cost`'s key: the floors and the tares plus the placed weight, each over `L1` containers. */
+function billedWeightTerm(weights, containers, placed, opened) {
+  if (opened === 0n) return 0n;
+  const byFloor = leastOfInventory(containers.map((container) => [container.floor, container.quantity]), opened);
+  const byTare = leastOfInventory(containers.map((container) => [container.tare, container.quantity]), opened);
+  if (byFloor === null || byTare === null) return null;
+  return max(byFloor, byTare + smallest(weights, placed));
+}
+
+/** `lowest_landed_cost`'s key: the cheapest reachable charge over `L1`, and the cheapest covers of the placed weight and count. */
+function landedChargeTerm(volumes, weights, shrinks, containers, placed, opened) {
+  if (opened === 0n || placed === 0n) return 0n;
+  const cheapest = [];
+  const byWeight = [];
+  const byItems = [];
+  for (const container of containers) {
+    const reachable = container.brackets.filter(([limit, charge]) => charge !== null && container.floor <= limit);
+    for (const [limit, charge] of reachable) {
+      const carried = container.payload === null ? limit - container.tare : min(limit - container.tare, container.payload);
+      let count = fit(weights, carried);
+      if (!shrinks) count = min(count, fit(volumes, container.usable));
+      if (container.maxItems !== null) count = min(count, container.maxItems);
+      byWeight.push([charge, carried, container.quantity]);
+      byItems.push([charge, count, container.quantity]);
+    }
+    if (reachable.length > 0) cheapest.push([reachable.map(([, charge]) => charge).reduce(min), container.quantity]);
+  }
+  const terms = [leastOfInventory(cheapest, opened), fractionalCover(byWeight, smallest(weights, placed)),
+    fractionalCover(byItems, placed)];
+  return terms.some((term) => term === null) ? null : terms.reduce(max);
+}
+
+/**
+ * The billed key of `shipping_cost` or `lowest_landed_cost`, or `null` when no priceable
+ * inventory carries a packing that leaves exactly `L0` behind. Each opened container bills at
+ * least its `floor`, `max(tare, dimensional)`, and at least its tare plus what it carries. A
+ * rate-table bracket is reachable from a floor within it; there a container carries at most the
+ * bracket's bound less its tare (and its `max_payload`), so at most the lightest-first count under
+ * that, its usable volume and `max_items`. The cheapest reachable charge over the `L1` containers
+ * and the cheapest covers of the placed weight and of the placed count each bound the charge; the
+ * largest is stated. O(c b t + c b log(c b)) for `t` runs and `b` brackets per type.
+ */
+function billedTerm(name, volumes, weights, shrinks, containers, bound) {
+  const [unpacked, opened] = bound;
+  const placed = runCount(volumes) - unpacked;
+  if (name === 'billed_weight') return billedWeightTerm(weights, containers, placed, opened);
+  return landedChargeTerm(volumes, weights, shrinks, containers, placed, opened);
+}
+
 /**
  * A covered objective's bound in its own score order, or `null` with the reason a ceiling
  * withholds it: the one refusal predicate's, or the objective's own term's, which withholds
  * that objective alone. `values` yields the value runs, read only by `maximum_value`, so no
- * other objective parses `Item.value`. Exported so the shared scene can hold it to the oracle.
+ * other objective parses `Item.value`. A billed objective reads each type's `tare`, `floor` and
+ * `brackets` as well, and `priced` is false where the configuration has no divisor to bill by.
+ * Exported so the shared scene can hold it to the oracle.
  */
-export function objectiveLowerBound(name, values, volumes, weights, shrinks, containers) {
+export function objectiveLowerBound(name, values, volumes, weights, shrinks, containers, priced = true) {
   const bound = lowerBound(volumes, weights, shrinks, containers);
   if (bound === null) return { bound: null, withheld: 'the request is past a declared ceiling' };
-  const stated = BOUND_ORDERS.get(name).map((position) => (typeof position === 'number'
-    ? bound[position] : objectiveTerm(position, values, volumes, shrinks, containers, bound[0])));
+  const order = BOUND_ORDERS.get(name);
+  const billedKey = order.find((position) => BILLED_KEYS.includes(position));
+  const billed = billedKey === undefined || !priced ? null : billedTerm(billedKey, volumes, weights, shrinks, containers, bound);
+  if (billedKey !== undefined && billed === null) return { bound: null, withheld: UNPRICEABLE };
+  const stated = order.map((position) => (typeof position === 'number' ? bound[position]
+    : position === billedKey ? billed : objectiveTerm(position, values, volumes, shrinks, containers, bound[0])));
   if (stated.some((value) => value > MAX_BOUND_VALUE)) {
     return { bound: null, withheld: `the ${name} key is past the portable ceiling` };
   }
@@ -308,7 +406,38 @@ function statedBound(request, status, items, containers) {
   if (status === 'infeasible') return { bound: null, withheld: "status is 'infeasible'" };
   if (status === 'invalid_result') return { bound: null, withheld: "status is 'invalid_result'" };
   const [volumes, weights, shrinks, types] = boundInputs(items, containers);
-  return objectiveLowerBound(name, () => valueRuns(items), volumes, weights, shrinks, types);
+  const configuration = getOr(request, 'configuration', {});
+  const priced = !BILLED_BOUND_OBJECTIVES.includes(name) || getNull(configuration, 'dimensional_weight_divisor') !== null;
+  const billed = BILLED_BOUND_OBJECTIVES.includes(name) && priced
+    ? containers.values().map((spec, index) => ({ ...types[index], ...billingOf(spec, configuration, name) }))
+    : types;
+  return objectiveLowerBound(name, () => valueRuns(items), volumes, weights, shrinks, billed, priced);
+}
+
+/**
+ * One type's billing floor, tare and priced brackets, recomputed from the request. The
+ * floor is the dimensional weight of the declared outer size, else of a pallet's deck at the
+ * declared height, else of the inner size, and 0 for a bag, whose billed package can be smaller;
+ * a bracket's charge is `max(price, minimum)` with the surcharge rounded up.
+ */
+function billingOf(spec, configuration, name) {
+  const size = spec.outer ?? (spec.deck === null ? spec.inner : [spec.deck[2], spec.deck[3], spec.inner[2]]);
+  const dimensional = spec.flatBag ? 0n : dimensionalWeight(size, int(at(configuration, 'dimensional_weight_divisor'), 'dimensional_weight_divisor'),
+    text(getOr(configuration, 'dimensional_weight_length_unit', 'in'), 'dimensional_weight_length_unit'),
+    text(getOr(configuration, 'dimensional_weight_weight_unit', 'lb'), 'dimensional_weight_weight_unit'));
+  const table = name === 'lowest_landed_cost' ? spec.rateTable : null;
+  const brackets = [];
+  if (table !== null) {
+    const bounds = list(at(table, 'weight_brackets_g'), 'weight_brackets_g').map((grams) => pyInt(grams, 'bracket'));
+    const prices = list(at(table, 'prices_minor'), 'prices_minor').map((price) => pyInt(price, 'price'));
+    const minimum = pyInt(getOr(table, 'minimum_charge_minor', 0), 'minimum_charge_minor');
+    const permille = pyInt(getOr(table, 'fuel_surcharge_permille', 0), 'fuel_surcharge_permille');
+    for (let index = 0; index < Math.min(bounds.length, prices.length); index += 1) {
+      const base = max(prices[index], minimum);
+      brackets.push([bounds[index] * TICKS_PER_GRAM, base + ceilDiv(base * permille, 1000n)]);
+    }
+  }
+  return { tare: spec.tareWeight, floor: max(spec.tareWeight, dimensional), brackets };
 }
 
 /** The first position where `score` leaves `bound`, and whether it is above (1) or below (-1). */

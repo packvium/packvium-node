@@ -10,7 +10,7 @@ import {
 import { Refusal, contract, issue, shape } from './outcome.js';
 import { Ratio, abs, ceilDiv, floorDiv, max, min, pyMod, ratioPpm } from './num.js';
 import { intTuple, list as listRepr, pyRepr, pyStr, strRepr, valueTuple } from './pyfmt.js';
-import { allows, intersectsTags, isRotation, rotated, sortedTags, volumeOf } from './spec.js';
+import { allows, girthBreach, intersectsTags, isRotation, rotated, sortedTags, volumeOf } from './spec.js';
 import {
   SCORE_SCALE, SQUARE_METRE_TICKS, checkCrush, checkDeckSupport, checkRouteRemovalOrder, checkStackDensity, checkStackTopLoad, checkSupportAndLoad,
   occupiedVolume, placedHull, propagateLoad, supportGraph, validNesting,
@@ -97,7 +97,8 @@ const optionalTuple = (values) => (values === null ? 'None' : valueTuple(values)
 
 /**
  * `achieved_dimensions` is present exactly when the container declares a soft size, and equals
- * the tight extent; a bag's extent must pass the girth rule, widened by a side gusset (1.10).
+ * the tight extent; a bag's extent must pass the girth rule, widened by a side gusset (1.10)
+ * and lengthened by a bottom one, flat or standing.
  */
 export function checkAchievedExtent(packed, spec, clearance, issues) {
   const reported = getNull(packed, 'achieved_dimensions');
@@ -113,11 +114,8 @@ export function checkAchievedExtent(packed, spec, clearance, issues) {
   if (!matchesInts(stated, [a, b, c])) {
     issues.push(issue('achieved_dimensions_mismatch', `${packedId}: reported ${optionalTuple(stated)}, computed ${intTuple([a, b, c])}`));
   }
-  if (spec.flatBag && (a + c > spec.inner[0] || b + c > spec.inner[1] + spec.sideGusset)) {
-    const gusset = spec.sideGusset > 0n ? `, side gusset ${spec.sideGusset}` : '';
-    issues.push(issue('bag_girth_exceeded',
-      `${packedId}: a + c = ${a + c}, b + c = ${b + c}, flat size ${spec.inner[0]} x ${spec.inner[1]}${gusset}`));
-  }
+  const breach = spec.flatBag ? girthBreach(spec, a, b, c) : null;
+  if (breach !== null) issues.push(issue('bag_girth_exceeded', `${packedId}: ${breach}`));
   packedId.verify();
 }
 

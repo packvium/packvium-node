@@ -97,7 +97,7 @@ test('an integer beyond the exact range is refused, never silently rounded', () 
   // 10^15 grams at 10^6 minor units per kilogram is 10^18, well past 2^53.
   refuses(
     () => quote(document, shipment({ actual_weight_g: 0, volume_mm3: 10 ** 15 })),
-    /outside JavaScript's exact integer range/,
+    /^quote amount 1000000000000000000 is above 9007199254740991 and cannot be represented exactly$/,
   );
 });
 
@@ -116,6 +116,45 @@ test('the largest exactly representable quote is still answered', () => {
   assert.ok(Number.isSafeInteger(result.quote.total_minor));
 });
 
+// M2: one ceiling, 2^53 - 1, and the first quote amount past it (in report order) is the one named.
+const ABOVE_CEILING = (value) => new RegExp(`^quote amount ${value} is above 9007199254740991 and cannot be represented exactly$`);
+
+function grams(overrides, volume) {
+  const document = tariffDocument({
+    dimensional_weight_divisor: 1,
+    cost_per_dimensional_kg_minor: { 'zone-a': 1000 },
+    minimum_charge_minor: 0,
+    fuel_surcharge_permille: 0,
+    accessorials: [{ accessorial_id: 'extra', permille_of_base: 1000 }],
+    ...overrides,
+  });
+  return () => quote(document, shipment({ actual_weight_g: 0, volume_mm3: volume, requested_accessorials: document.tariffs[0].versions[0].accessorials.map((entry) => entry.accessorial_id) }));
+}
+
+test('an input integer JSON.parse has already rounded is refused, not quoted from the rounded value', () => {
+  const document = tariffDocument();
+  for (const weight of [9007199254740992, 9007199254740993, 1e17 + 1]) {
+    refuses(() => quote(document, shipment({ actual_weight_g: weight })), /expected an exact integer/);
+  }
+});
+
+test('a quote amount is refused past the ceiling, named in report order', () => {
+  // dimensional and billed weight sit at 2^52 and the base charge is 2^53.
+  refuses(grams({ cost_per_dimensional_kg_minor: { 'zone-a': 2000 } }, 4503599627370496), ABOVE_CEILING('9007199254740992'));
+  // the base charge is exactly 2^53 - 1, the fuel surcharge is twice that.
+  refuses(grams({ fuel_surcharge_permille: 2000 }, 9007199254740991), ABOVE_CEILING('18014398509481982'));
+  // the base and fuel charge are inside; the accessorial at 2000 permille of the base is not.
+  refuses(grams({ accessorials: [{ accessorial_id: 'extra', permille_of_base: 2000 }] }, 4503599627370496),
+    ABOVE_CEILING('9007199254740992'));
+  // every component is inside and only their sum is above.
+  refuses(grams({}, 4503599627370496 * 1 + 1), ABOVE_CEILING('9007199254740994'));
+});
+
+test('a quote total exactly at the ceiling is answered', () => {
+  const result = grams({ accessorials: [] }, 9007199254740991)();
+  assert.equal(result.quote.total_minor, 9007199254740991);
+});
+
 // --------------------------------------------------------------------------- code points
 
 test('code-point ordering matches the other implementations, not UTF-16 order', () => {
@@ -129,6 +168,13 @@ test('code-point ordering falls back to length for a shared prefix', () => {
   assert.equal(compareCodePoints('ab', 'ab'), 0);
   assert.equal(compareCodePoints('ab', 'abc'), -1);
   assert.equal(compareCodePoints('abc', 'ab'), 1);
+});
+
+test('unrecognised key names are listed in code-point order (S-04)', () => {
+  assert.throws(
+    () => loadDocument({ '\u{1F600}': 1, 'Ａ': 1 }),
+    (error) => error instanceof CommerceInputError && error.message.endsWith('["Ａ","\u{1F600}"]'),
+  );
 });
 
 test('catalog id lists come back in code-point order', () => {
@@ -339,4 +385,14 @@ test('catalog pinned lookups preserve boundaries and rollback across a long hist
   }
   assert.equal(catalogVersionInfo(document, {catalog_id: 'c', as_of: 6, resolved_at: 100}).catalog.version, 65);
   assert.equal(catalogVersionInfo(document, {catalog_id: 'c', as_of: 0, resolved_at: 100}).catalog.version, 63);
+});
+
+test('tariff zones are validated in ascending code-point order of the zone key, whatever the insertion order (K2)', () => {
+  for (const zones of ['{"b":"x","2":"y"}', '{"2":"y","b":"x"}']) {
+    refuses(() => loadDocument(tariffDocument({ cost_per_dimensional_kg_minor: JSON.parse(zones) })), /\[2\]/);
+  }
+  for (const zones of ['{"b":-1,"2":-1}', '{"2":-1,"b":-1}']) {
+    refuses(() => loadDocument(tariffDocument({ cost_per_dimensional_kg_minor: JSON.parse(zones) })), /entries cannot be negative/);
+  }
+  refuses(() => loadDocument(tariffDocument({ cost_per_dimensional_kg_minor: { b: -1, a: 'x' } })), /\[a\]/);
 });

@@ -129,6 +129,10 @@ test('values compare, hash and convert as Python\'s do', () => {
   assert.equal(pyCmp(2.5, 1.5), 1);
   assert.equal(pyCmp(1.5, 1.5), 0);
   assert.equal(pyCmp(1e21, 10n ** 21n), 0);
+  assert.equal(pyCmp(1, JSON.parse('1e999')), -1);
+  assert.equal(pyCmp(1, JSON.parse('-1e999')), 1);
+  assert.equal(pyCmp(JSON.parse('1e999'), 10n ** 400n), 1);
+  assert.equal(pyCmp(JSON.parse('-1e999'), -(10n ** 400n)), -1);
   assert.equal(pyCmp(-1.5, -1), -1);
   assert.ok(pyEq([1, [2], null], [true, [2n], null]));
   assert.ok(!pyEq([1, 2], [1, 3]));

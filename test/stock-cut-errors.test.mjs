@@ -38,3 +38,20 @@ test('replacement and lock refuse unreadable stock fields through the revision e
     assert.equal(stockCutBoxes(fixed, artifact, 1).containers[1].cost_minor, cost ?? 0);
   }
 });
+
+test('a cut box priced past 2^53 - 1 is refused, not rounded (C-13)', () => {
+  const sides = { length: '10', width: '10', height: '10' };
+  const request = { items: [{ id: 'cube', dimensions: sides }], containers: [
+    { id: 'machine', inner_dimensions: sides, made_to_measure: { minimum: sides, increment: sides, cost_per_square_metre_minor: 9007199254740991 } },
+  ] };
+  const artifact = buildOperationalArtifact(request, packFallback(request));
+  request.fixed_placements = [{ container_type: 'machine' }];
+  // 10 mm cube: 600 mm^2 of surface is far below a square metre, so the price stays inside the ceiling.
+  assert.ok(Number.isSafeInteger(stockCutBoxes(request, artifact, 1).containers[1].cost_minor));
+  // The same rate on a cut box of 2000 mm per side is 24 m^2 and passes it.
+  const cut = JSON.parse(JSON.stringify(artifact));
+  for (const axis of ['length', 'width', 'height']) cut.geometry.containers[0].inner_dimensions[axis] = String(2000 * 16000);
+  assert.throws(() => stockCutBoxes(request, cut, 1),
+    (error) => error instanceof PlanRevisionError && error.code === 'invalid_revision'
+      && error.message === "a made-to-measure container's cost_per_square_metre_minor prices the largest box above 9007199254740991");
+});

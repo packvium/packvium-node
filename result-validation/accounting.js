@@ -6,7 +6,7 @@ import {
 } from './json.js';
 import { issue, shape } from './outcome.js';
 import { pyRepr, pyStr, strRepr } from './pyfmt.js';
-import { holds, intersectsTags, rotationAxes } from './spec.js';
+import { girthBreach, holds, intersectsTags, rotationAxes } from './spec.js';
 
 export function checkStructure(result, issues) {
   const summary = at(result, 'summary');
@@ -112,12 +112,12 @@ export function checkAccounting(result, context, issues) {
 }
 
 /**
- * Whether one envelope of this size fits the empty container: its frame and, for a flat bag,
+ * Whether one envelope of this size fits the empty container: its frame and, for a bag,
  * both girth sums with the envelope alone at the origin.
  */
 export function fitsEmpty(container, size) {
   if (size.some((side, axis) => side > container.inner[axis])) return false;
-  return !container.flatBag || (size[0] + size[2] <= container.inner[0] && size[1] + size[2] <= container.inner[1] + container.sideGusset);
+  return !container.flatBag || girthBreach(container, ...size) === null;
 }
 
 /**

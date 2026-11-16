@@ -138,6 +138,25 @@ test('resolution orders rules by priority then id, never by declaration order', 
   assert.match(unpackedByPolicy(withRules(prioritised)).details[0], /^zebra-routing@1: /);
 });
 
+test('the id tie-break compares code points, not UTF-16 units (S-02)', () => {
+  // "\uFF21" is below an astral id by code point and above it by UTF-16 unit; Python and Rust
+  // cite the fullwidth rule.
+  const rules = ['\u{1F600}', '\uFF21'].map((id, index) => ({
+    id, version: 1, effective_at: AS_OF, priority: 10,
+    require_container_tag: { item_tag: 'food', container_tag: ['reefer', 'dock'][index] },
+  }));
+  for (const declared of [rules, [...rules].reverse()]) {
+    assert.match(unpackedByPolicy(withRules(declared)).details[0], /^\uFF21@1: /);
+  }
+});
+
+test('unknown key names in a refusal are listed in code-point order (S-04)', () => {
+  assert.throws(
+    () => parsePolicy({ as_of: 0, '\u{1F600}': 1, '\uFF21': 1 }),
+    (error) => error instanceof PolicyError && error.message.endsWith('\uFF21, \u{1F600}'),
+  );
+});
+
 test('an undeclared shipment fact is absent rather than matching anything', () => {
   const rule = {
     id: 'r', version: 1, effective_at: 0, priority: 0,

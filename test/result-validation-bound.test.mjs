@@ -69,7 +69,82 @@ if (!fs.existsSync(SCENE)) {
       .map((scenario) => scenario.name || scenario.fixture);
     assert.deepEqual(disagreements, []);
   });
+
+  test('the billed objectives\' vectors match the shared scene', () => {
+    const scene = JSON.parse(fs.readFileSync(SCENE, 'utf8'));
+    assert.ok(scene.billed.length > 0);
+    const disagreements = scene.billed.filter((scenario) => {
+      const [volumes, weights, shrinks, containers] = sceneInputs(scenario);
+      const billed = containers.map((container, index) => {
+        const { tare, dimensional, brackets } = scenario.containers[index];
+        const floor = integer(tare) > integer(dimensional) ? integer(tare) : integer(dimensional);
+        return { ...container, tare: integer(tare), floor, brackets: brackets.map(([limit, charge]) => [integer(limit), optional(charge)]) };
+      });
+      const { bound } = objectiveLowerBound(scenario.objective, () => [], volumes, weights, shrinks, billed);
+      return JSON.stringify(bound && bound.map(Number)) !== JSON.stringify(scenario.vector);
+    }).map((scenario) => scenario.fixture || scenario.name);
+    assert.deepEqual(disagreements, []);
+  });
+
+  test('a bound where none is stated is an optimality_bound_mismatch', async () => {
+    // Every built-in objective is covered since; a made-to-measure container (D13) is
+    // where no bound is stated.
+    const { packFallback } = await import('../fallback.js');
+    const fixture = new URL('./fixtures/feature-made-to-measure-dimensional-weight-on-outer.json', import.meta.url);
+    const request = JSON.parse(fs.readFileSync(fixture, 'utf8'));
+    const packed = packFallback(request);
+    packed.optimality.lower_bound = [0];
+    assert.deepEqual(validateWith(null, request, packed).map(({ code, detail }) => [code, detail]), [[
+      'optimality_bound_mismatch', 'lower_bound is reported where no bound is stated: a container is made to measure',
+    ]]);
+  });
 }
+
+test('a billed objective states the bound the validator recomputes, and one moved by one is caught', async () => {
+  const { packFallback } = await import('../fallback.js');
+  for (const configuration of [
+    { objective: 'shipping_cost', dimensional_weight_divisor: 5000, dimensional_weight_length_unit: 'cm', dimensional_weight_weight_unit: 'kg' },
+    { objective: 'lowest_landed_cost', dimensional_weight_divisor: 5000, dimensional_weight_length_unit: 'cm', dimensional_weight_weight_unit: 'kg' },
+  ]) {
+    const priced = { weight_brackets_g: [1, 5000], prices_minor: [900, 400], minimum_charge_minor: 450, fuel_surcharge_permille: 85 };
+    const request = {
+      items: [{ id: 'cube', quantity: 2, weight: '300 g', dimensions: { length: '100', width: '100', height: '100' } }],
+      containers: [
+        { id: 'box', tare_weight: '50 g', inner_dimensions: { length: '200', width: '100', height: '100' }, rate_table: priced },
+        { id: 'bag', inner_dimensions: { length: '300', width: '100', height: '100' }, deformable_boundary: { kind: 'flat_bag' }, rate_table: priced },
+        { id: 'walled', inner_dimensions: { length: '200', width: '100', height: '100' }, outer_dimensions: { length: '210', width: '110', height: '120' },
+          rate_table: { weight_brackets_g: [100], prices_minor: [1] } },
+      ],
+      configuration,
+    };
+    const packed = packFallback(request);
+    assert.ok(Array.isArray(packed.optimality.lower_bound), configuration.objective);
+    assert.deepEqual(validateWith(null, request, packed), [], configuration.objective);
+    packed.optimality.lower_bound[1] -= 1;
+    assert.ok(validateWith(null, request, packed).some((found) => found.code === 'optimality_bound_mismatch'), configuration.objective);
+  }
+});
+
+test('a billed key is withheld where nothing can price it or no divisor bills it', () => {
+  const box = {
+    innerVolume: 1000n, baseArea: 100n, height: 10n, usable: 1000n, costMinor: 0n, payload: null, maxItems: 1n, quantity: null,
+    tare: 0n, floor: 10n, brackets: [[5n, 100n]],
+  };
+  const unpriceable = 'no priceable inventory carries a packing that attains the count bound';
+  const landed = (containers, priced = true) => objectiveLowerBound('lowest_landed_cost', () => [], [[1n, 2n]], [[1n, 2n]], false, containers, priced);
+  assert.deepEqual(landed([box]), { bound: null, withheld: unpriceable });
+  // One item per container opens two, each paying the one charge it can reach.
+  assert.deepEqual(landed([{ ...box, floor: 0n }]).bound.slice(0, 2), [0n, 200n]);
+  assert.deepEqual(landed([{ ...box, floor: 0n }], false), { bound: null, withheld: unpriceable });
+  // The one cheap single-item container is taken whole, then the dear one covers the other
+  // item at half its charge: 10 + ceil(100 / 2).
+  const capped = { ...box, floor: 0n, brackets: [[5n, 10n]], quantity: 1n };
+  const unlimited = { ...box, floor: 0n, brackets: [[5n, 100n]], maxItems: null };
+  assert.deepEqual(landed([capped, unlimited]).bound.slice(0, 2), [0n, 60n]);
+  // Shrinking instances drop the volume terms; one opened container still bills its floor.
+  const shipping = (containers) => objectiveLowerBound('shipping_cost', () => [], [[1n, 2n]], [[1n, 2n]], true, containers);
+  assert.deepEqual(shipping([{ ...box, maxItems: null, quantity: 1n }]).bound.slice(0, 2), [0n, 10n]);
+});
 
 test('an unlimited capacity, a negative one and zero-volume instances are read as the reference reads them', () => {
   const container = {

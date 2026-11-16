@@ -123,6 +123,40 @@ test('six-place ratios round an exact half to even, from the exact fraction (S13
   assert.ok(equals(doubleFraction(Number.MIN_VALUE), [1n, 2n ** 1074n]));
 });
 
+test('a reported ratio is six places of the correctly rounded double, as the other engines write it', async () => {
+  const { packFallback, __ratiosForTests: { ratioDouble, ratioPlaces } } = await import('../fallback.js');
+  // [numerator, denominator, Python's `n / d`, Python's f"{n / d:.6f}"]. The first is 5x5x2 mm in
+  // 400x250x200 mm, in cubic ticks: an exact 0.0000025 whose double lies above the half.
+  const reference = [
+    [204800000000000n, 81920000000000000000n, 2.5e-06, '0.000003'],
+    [384307168202282325n, 1152921504606846976n, 0.3333333333333333, '0.333333'],
+    [1208925819614629174706177n, 2417851639229258349412352n, 0.5, '0.500000'],
+    [9007199254740993n, 18014398509481984n, 0.5, '0.500000'],
+    [100000000000000000000000000007n, 300000000000000000000000000000n, 0.3333333333333333, '0.333333'],
+    [1n, 1000000000000000000000000000000n, 1e-30, '0.000000'],
+    [123456789012345678901n, 987654321098765432109n, 0.1249999988609375, '0.125000'],
+  ];
+  for (const [numerator, denominator, quotient, text] of reference) {
+    assert.equal(ratioDouble(numerator, denominator), quotient);
+    assert.equal(ratioPlaces(numerator, denominator), text);
+  }
+  // Below 2^53 the division of two Numbers is already the correctly rounded one.
+  let state = 12345;
+  const next = () => { state = (state * 1103515245 + 12345) % 2147483648; return state % 1000000 + 1; };
+  for (let i = 0; i < 20000; i++) {
+    const numerator = next(), denominator = next();
+    assert.equal(ratioDouble(BigInt(numerator), BigInt(denominator)), numerator / denominator);
+  }
+  assert.equal(ratioPlaces(1, 128), '0.007812');     // the double is the half itself: to even
+  assert.equal(ratioPlaces(0, 7), '0.000000');
+  const result = packFallback({
+    configuration: {},
+    items: [{ id: 'a', dimensions: { length: 5, width: 5, height: 2 }, weight: 1, quantity: 1 }],
+    containers: [{ id: 'c', inner_dimensions: { length: 400, width: 250, height: 200 }, max_weight: 1000, quantity: 1 }],
+  });
+  assert.equal(result.containers[0].volume_utilization, '0.000003');
+});
+
 test('support_ratio and volume_utilization are written half to even (S13)', async () => {
   const { packFallback } = await import('../fallback.js');
   const mm = (side) => ({ length: side, width: side, height: side });

@@ -34,7 +34,7 @@ export function exact(value) {
   const number = Number(value);
   if (!Number.isSafeInteger(number)) {
     throw new CommerceInputError(
-      `${value} is outside JavaScript's exact integer range; this quote cannot be represented`,
+      `quote amount ${value} is above ${Number.MAX_SAFE_INTEGER} and cannot be represented exactly`,
     );
   }
   return number;

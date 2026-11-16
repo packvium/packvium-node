@@ -154,6 +154,8 @@ const MAX_VOLUME_TICKS3 = 10n ** 30n;
  * 64-bit integer, which is how Rust and PHP add a container's payload (R19-01).
  */
 const MAX_WEIGHT_TICKS = 2n ** 63n - 1n;
+/** K3: the most points a convex hull item may list; the shape build is O(v^4), so the cap is checked at admission. */
+const MAXIMUM_HULL_VERTICES = 32;
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -398,11 +400,19 @@ function checkItem(raw, where, length, weight, lengthTicks) {
   optional(item, 'allowed_rotations', where, (value, field) => allowedRotations(value, field, item));
   optional(item, 'ground_contact_rule', where, oneOf(GROUND_CONTACT_RULES));
   optional(item, 'shape_type', where, oneOf(SHAPE_TYPES));
+  optional(item, 'hull_vertices', where, hullVertexCount);
   for (const name of ITEM_BOOLEANS) optional(item, name, where, requireBoolean);
   const listed = item.allowed_rotations;
   if (listed != null && !listed.some((code) => !item.keep_upright || UPRIGHT_ORIENTATIONS.includes(code))) {
     throw new InvalidRequestError('invalid_value', `${where}/allowed_rotations`,
       'must allow at least one rotation after keep_upright');
+  }
+}
+
+/** K3: only the count, so no per-vertex work runs on an oversized hull. A non-list reports its own type error first. O(1). */
+function hullVertexCount(raw, field) {
+  if (requireList(raw, field).length > MAXIMUM_HULL_VERTICES) {
+    throw new InvalidRequestError('above_maximum', field, `must have at most ${MAXIMUM_HULL_VERTICES} vertices`);
   }
 }
 
@@ -522,19 +532,22 @@ export const DEFORMABLE_BOUNDARY_KINDS = Object.freeze(['flat_bag', 'gusseted_ba
 const BAG_EXCLUSIONS = Object.freeze(['obstacles', 'axles', 'access_directions', 'max_stack_density',
   'outer_dimensions', 'void_fill_reserve_ratio', 'made_to_measure', 'pallet_overhang_limit']);
 
+/**: the frames a gusseted bag may be packed in. */
+const BAG_ORIENTATIONS = Object.freeze(['flat', 'standing']);
+/** The keys a gusseted bag's boundary may carry (1.10 side gusset; 1.11 bottom gusset and orientation). */
+const GUSSETED_BAG_FIELDS = Object.freeze(['bottom_gusset_depth', 'kind', 'orientation', 'side_gusset_depth']);
+
 /**
- * The boundary object top to bottom -- kind, unknown keys, the gusset (1.10) -- then the
- * container fields a bag refuses. O(1).
+ * The boundary object top to bottom -- kind, unknown keys, the gussets, the orientation --
+ * then the container fields a bag refuses. O(1).
  */
 function deformableBoundary(container, raw, field, where, length, inner) {
   const boundary = requireObject(raw, field);
   const kind = required(boundary, 'kind', field);
   requireOneOf(kind, field + pointer('kind'), DEFORMABLE_BOUNDARY_KINDS);
   const gusseted = kind === 'gusseted_bag';
-  requireKnownFields(boundary, field, gusseted ? ['kind', 'side_gusset_depth'] : ['kind']);
-  if (gusseted) {
-    sideGussetDepth(required(boundary, 'side_gusset_depth', field), field + pointer('side_gusset_depth'), length, inner);
-  }
+  requireKnownFields(boundary, field, gusseted ? GUSSETED_BAG_FIELDS : ['kind']);
+  if (gusseted) gussetedBag(boundary, field, length, inner);
   for (const name of BAG_EXCLUSIONS) {
     if (setBesideABag(name, hasOwn(container, name) ? container[name] : null)) {
       throw new InvalidRequestError('not_allowed', where + pointer(name), 'cannot be combined with deformable_boundary');
@@ -542,11 +555,30 @@ function deformableBoundary(container, raw, field, where, length, inner) {
   }
 }
 
-/** A length, positive once read in ticks, and no deeper than the bag's inner width. */
-function sideGussetDepth(value, field, length, inner) {
+/**
+ * The side gusset, then the bottom one, each a positive length within its fold; with neither,
+ * the side gusset is reported missing as in 1.10. Then the orientation, and a standing bag's
+ * bottom gusset. O(1).
+ */
+function gussetedBag(boundary, field, length, inner) {
+  const side = hasOwn(boundary, 'side_gusset_depth') ? boundary.side_gusset_depth : null;
+  const bottom = hasOwn(boundary, 'bottom_gusset_depth') ? boundary.bottom_gusset_depth : null;
+  if (side == null && bottom == null) required(boundary, 'side_gusset_depth', field);
+  if (side != null) gussetDepth(side, field + pointer('side_gusset_depth'), length, inner[1], 'exceeds inner_dimensions width');
+  if (bottom != null) gussetDepth(bottom, field + pointer('bottom_gusset_depth'), length, 2 * inner[0], 'exceeds twice inner_dimensions length');
+  const orientation = hasOwn(boundary, 'orientation') ? boundary.orientation : null;
+  if (orientation == null) return;
+  requireOneOf(orientation, field + pointer('orientation'), BAG_ORIENTATIONS);
+  if (orientation === 'standing' && bottom == null) {
+    throw new InvalidRequestError('missing_field', field + pointer('bottom_gusset_depth'), 'is required when orientation is standing');
+  }
+}
+
+/** A length, positive once read in ticks, and no deeper than its fold allows. */
+function gussetDepth(value, field, length, deepest, tooDeep) {
   const depth = length(value, field);
   if (depth === 0) throw new InvalidRequestError('invalid_value', field, 'must be positive');
-  if (depth > inner[1]) throw new InvalidRequestError('invalid_value', field, 'exceeds inner_dimensions width');
+  if (depth > deepest) throw new InvalidRequestError('invalid_value', field, tooDeep);
 }
 
 // An empty obstacle list and a zero reserve change nothing, so only they are let through.
@@ -591,6 +623,20 @@ function rateTable(raw, where, currency) {
   optional(table, 'minimum_charge_minor', where, atLeast(0));
   optional(table, 'fuel_surcharge_permille', where, atLeast(0));
   optional(table, 'currency', where, (v, f) => rateTableCurrency(v, f, currency));
+  if (landedTopBracket(table) > BigInt(MAX_EXACT_MAGNITUDE)) {
+    throw new InvalidRequestError('above_maximum', where,
+      `must price its top bracket at most ${MAX_EXACT_MAGNITUDE} minor units with the fuel surcharge`);
+  }
+}
+
+/** The dearest charge a table can bill, surcharge included, in `BigInt` (two values near 2^53 multiply past a `Number`); 0n for a table with no prices. O(prices). */
+function landedTopBracket(table) {
+  if (!Array.isArray(table.prices_minor) || table.prices_minor.length === 0) return 0n;
+  // A loop, not a spread: a long table would overflow the call stack as arguments.
+  let top = table.minimum_charge_minor ?? 0;
+  for (const price of table.prices_minor) if (price > top) top = price;
+  const base = BigInt(top);
+  return base + (base * BigInt(table.fuel_surcharge_permille ?? 0) + 999n) / 1000n;
 }
 
 /**

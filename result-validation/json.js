@@ -159,8 +159,9 @@ function numberOf(value) {
 
 const sign = (difference) => (difference < 0n ? -1 : difference > 0n ? 1 : 0);
 
-/** An integer against a finite float, exactly, as Python compares `int` with `float`. */
+/** An integer against a float, exactly, as Python compares `int` with `float`. */
 function compareIntegerToFloat(integer, float) {
+  if (!Number.isFinite(float)) return float > 0 ? -1 : float < 0 ? 1 : 0;
   if (Number.isInteger(float)) return sign(integer - BigInt(float));
   return integer <= BigInt(Math.floor(float)) ? -1 : 1;
 }

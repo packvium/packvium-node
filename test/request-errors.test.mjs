@@ -367,3 +367,80 @@ test('every item weight times its quantity and the heaviest tare fit the ceiling
   assert.equal(result.containers.reduce((total, container) => total + BigInt(container.payload_weight.ticks), 0n),
     2n ** 63n - 2n);
 });
+
+test('a rate table prices its top bracket at most 9007199254740991 with the fuel surcharge (M1)', () => {
+  const message = 'must price its top bracket at most 9007199254740991 minor units with the fuel surcharge';
+  const table = (edit) => (request) => {
+    request.containers[0].rate_table = { weight_brackets_g: [1000, 5000], prices_minor: [100, 200] };
+    edit(request.containers[0].rate_table);
+  };
+  const refused = (edit) => assertRefused(table(edit), 'above_maximum', '/containers/0/rate_table', message);
+  refused((t) => { t.prices_minor = [100, 9007199254740991]; t.fuel_surcharge_permille = 1; });
+  refused((t) => { t.minimum_charge_minor = 9007199254740991; t.fuel_surcharge_permille = 1; });
+  refused((t) => { t.prices_minor = [9007199254740990, 9007199254740991]; t.fuel_surcharge_permille = 9007199254740991; });
+  // base 9e15 is inside; with 1000 permille the landed charge is not.
+  refused((t) => { t.prices_minor = [100, 9000000000000000]; t.fuel_surcharge_permille = 1000; });
+  // A wrong-typed price still reports its own error first.
+  assertRefused(table((t) => { t.prices_minor = [100, '9007199254740991']; t.fuel_surcharge_permille = 1000; }),
+    'wrong_type', '/containers/0/rate_table/prices_minor/1', 'must be an integer');
+  // Landed at or inside the ceiling is answered, including a base x permille product that passes 2^53.
+  for (const [price, permille] of [[9007199254740991, 0], [9007199254740991, null], [4503599627370495, 1000], [9000000000000000, 0], [10000000000000, 1000]]) {
+    const request = base();
+    table((t) => { t.prices_minor = [100, price]; if (permille !== null) t.fuel_surcharge_permille = permille; })(request);
+    assert.ok(packFallback(request).containers.length > 0);
+  }
+});
+
+test('the top-bracket ceiling reads a rate table of any length without overflowing the stack (M1)', () => {
+  const brackets = (price) => (request) => {
+    request.containers[0].rate_table = { weight_brackets_g: Array.from({ length: 300_000 }, (_, index) => index + 1),
+      prices_minor: Array.from({ length: 300_000 }, () => price), fuel_surcharge_permille: 1 };
+  };
+  const request = base();
+  brackets(5)(request);
+  assert.ok(packFallback(request).containers.length > 0);
+  assertRefused(brackets(9007199254740991), 'above_maximum', '/containers/0/rate_table',
+    'must price its top bracket at most 9007199254740991 minor units with the fuel surcharge');
+});
+
+test('a measure is a sign, ASCII digits and a decimal point with digits on both sides, or a fraction, as in Python (K1)', () => {
+  const side = (spelling) => (request) => { request.items[0].dimensions.length = spelling; };
+  const refusedSpellings = ['100 millimeters', '100.', '.5', '+.5', '-.5', '0x64', '1e2', '1_0', '1/2/3', '1.5.2', '1 /2 3', '0.1111111111111111111', '１'];
+  for (const spelling of refusedSpellings) {
+    assertRefused(side(spelling), 'wrong_type', '/items/0/dimensions/length', 'must be a measure');
+  }
+  assertRefused(side('-5'), 'negative_measure', '/items/0/dimensions/length', 'cannot be negative');
+  assertRefused((request) => { request.items[0].weight = '.5 g'; }, 'wrong_type', '/items/0/weight', 'must be a measure');
+  assertRefused((request) => { request.items[0].weight = '1 mm'; }, 'wrong_type', '/items/0/weight', 'must be a measure');
+  for (const spelling of ['100', '100.0', '0.5', '+5', '1/2', '1 1/2', '5 /2', '100 MM', '0.111111111111111111']) {
+    const request = base();
+    side(spelling)(request);
+    assert.ok(packFallback(request).containers.length >= 0, spelling);
+  }
+  for (const weight of ['1 g', '1 G', '1 kg', '1 KG', '1 lb', '1 LBS']) {
+    const request = base();
+    request.items[0].weight = weight;
+    assert.ok(packFallback(request).containers.length >= 0, weight);
+  }
+});
+
+test('a hull lists at most 32 vertices, refused before any hull is built (K3)', () => {
+  const ring = (count) => Array.from({ length: count }, (_, index) => {
+    const angle = (2 * Math.PI * index) / count;
+    return { x: (50 + 40 * Math.cos(angle)).toFixed(3), y: (50 + 40 * Math.sin(angle)).toFixed(3), z: index % 2 === 0 ? '0' : '100' };
+  });
+  const hull = (vertices) => (request) => {
+    Object.assign(request.items[0], { shape_type: 'convex_hull', hull_vertices: vertices });
+  };
+  assertRefused(hull(ring(33)), 'above_maximum', '/items/0/hull_vertices', 'must have at most 32 vertices');
+  // The cap comes before the per-vertex rules, and a non-list reports its own type error first.
+  assertRefused(hull([...ring(32), 'not a vertex']), 'above_maximum', '/items/0/hull_vertices', 'must have at most 32 vertices');
+  assertRefused(hull('many'), 'wrong_type', '/items/0/hull_vertices', 'must be a list');
+  const request = base();
+  hull(ring(32))(request);
+  try {
+    packFallback(request);
+  } catch (error) {
+    assert.ok(!/at most 32 vertices/.test(error.message), error.message);
+  }
+});

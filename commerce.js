@@ -68,8 +68,10 @@ function asList(value, path) {
 }
 
 function asInteger(value, path) {
-  // A JSON boolean where an exact integer belongs is a caller mistake, not a 0 or a 1.
-  if (typeof value !== 'number' || !Number.isInteger(value)) {
+  // A JSON boolean where an exact integer belongs is a caller mistake, not a 0 or a 1. Past
+  // 2^53 - 1 the parsed Number is already rounded, so the exact arithmetic after it would
+  // start from a value the caller never sent.
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
     fail(path, 'expected an exact integer');
   }
   return value;
@@ -81,11 +83,11 @@ function asText(value, path) {
 }
 
 function checkKeys(value, path, required, optionalKeys = []) {
-  const missing = required.filter((key) => !Object.hasOwn(value, key)).sort();
+  const missing = required.filter((key) => !Object.hasOwn(value, key)).sort(compareCodePoints);
   if (missing.length > 0) fail(path, `missing required key(s) ${JSON.stringify(missing)}`);
   const unknown = Object.keys(value)
     .filter((key) => !required.includes(key) && !optionalKeys.includes(key))
-    .sort();
+    .sort(compareCodePoints);
   if (unknown.length > 0) fail(path, `unrecognised key(s) ${JSON.stringify(unknown)}`);
 }
 
@@ -182,7 +184,8 @@ function parseTariff(value, path, [carrierId, serviceId], number) {
   const zonesPath = `${path}.cost_per_dimensional_kg_minor`;
   const costPerDimensionalKgMinor = Object.create(null);
   const zones = asObject(fields.cost_per_dimensional_kg_minor, zonesPath);
-  for (const [zone, cost] of Object.entries(zones)) {
+  // K2: ascending code-point order, so the first error never depends on where a language puts integer-like keys.
+  for (const [zone, cost] of Object.entries(zones).sort(([left], [right]) => compareCodePoints(left, right))) {
     costPerDimensionalKgMinor[zone] = nonNegative(
       asInteger(cost, `${zonesPath}[${zone}]`), zonesPath,
       'cost_per_dimensional_kg_minor entries cannot be negative',

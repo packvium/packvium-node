@@ -287,12 +287,14 @@ function placementIdIssues(result) {
 }
 
 /**
- * A pallet's solving frame: the reported inner size is the declared deck, the load
- * may pass it by the limit at each end and side, and coordinates start at the corner of the
- * overhang zone. Without a limit the frame is the reported inner size and there is no deck.
+ * The frame the solver packed. A pallet's: the reported inner size is the declared
+ * deck, the load may pass it by the limit at each end and side, and coordinates start at the
+ * corner of the overhang zone. A standing bag's: the declared `L x W x H` turned to
+ * `W x H x L`. Otherwise the frame is the reported inner size and there is no deck.
  */
-function palletFrame(template, container, lengthUnit) {
+function packedFrame(template, container, lengthUnit) {
   const inner = size(container.inner_dimensions);
+  if (template?.deformable_boundary?.orientation === 'standing') return { frame: [inner[1], inner[2], inner[0]], deck: null };
   const limit = template?.pallet_overhang_limit;
   if (limit == null) return { frame: inner, deck: null };
   const x = requestLengthTicks(limit.length, lengthUnit);
@@ -320,7 +322,9 @@ function palletIssues(container, boxes, deck) {
 
 /**
  * A bag reports the package its placements make, and that package passes the girth
- * rule a + c <= L, b + c <= W + G, G a gusseted bag's side gusset (1.10) and 0 for a flat one.
+ * rule 2(a + c) <= 2L + K, b + c <= W + G lying flat, and 2(b + c) <= 2L + K, a + b <= W + G
+ * standing in its `W x H x L` frame; G and K are a gusseted bag's side (1.10) and bottom
+ * gussets, 0 where none is declared.
  * Measured on the physical boxes, as the score below is: meaningful only when no clearance
  * was configured.
  */
@@ -334,9 +338,12 @@ function flatBagIssues(template, container, boxes, inner, deck, lengthUnit) {
   const issues = [];
   const reported = container.achieved_dimensions == null ? null : size(container.achieved_dimensions);
   if (reported == null || reported[0] !== a || reported[1] !== b || reported[2] !== c) issues.push('achieved_dimensions_mismatch');
-  const depth = template.deformable_boundary.side_gusset_depth;
-  const gusset = depth == null ? 0 : requestLengthTicks(depth, lengthUnit);
-  if (a + c > inner[0] || b + c > inner[1] + gusset) issues.push('bag_girth_exceeded');
+  const boundary = template.deformable_boundary;
+  const depth = (name) => (boundary[name] == null ? 0 : requestLengthTicks(boundary[name], lengthUnit));
+  const side = depth('side_gusset_depth'), bottom = depth('bottom_gusset_depth');
+  const [along, across, length, width] = boundary.orientation === 'standing'
+    ? [b + c, a + b, inner[2], inner[0]] : [a + c, b + c, inner[0], inner[1]];
+  if (2 * along > 2 * length + bottom || across > width + side) issues.push('bag_girth_exceeded');
   return issues;
 }
 
@@ -362,7 +369,7 @@ export function validate(request, result) {
     }
     inventory.set(container.container_type, (inventory.get(container.container_type) ?? 0) + 1);
 
-    const { frame: inner, deck } = palletFrame(template, container, lengthUnit);
+    const { frame: inner, deck } = packedFrame(template, container, lengthUnit);
     const boxes = boxesOf(container, latticeSequences);
 
     if (template.max_items != null && boxes.length > template.max_items) issues.push('max_items_exceeded');
@@ -529,7 +536,7 @@ export function objective(request, result) {
     cost += containerCost(template, size(container.inner_dimensions));
 
     // Utilization and height are measured against the frame the solver packed.
-    const { frame: inner, deck } = palletFrame(template, container, lengthUnit);
+    const { frame: inner, deck } = packedFrame(template, container, lengthUnit);
     const total = volume(inner);
     const boxes = boxesOf(container, latticeSequences);
     // Occupied volume follows the shape: a hull's own volume, a compressible item's height
