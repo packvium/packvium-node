@@ -4,7 +4,7 @@ import {existsSync,readFileSync} from 'node:fs';
 import {
   InvalidDirectionError, LoadingDependencyGraph, SequenceError, SequenceReplayError, SequenceWarning,
   UnloadingDependencyGraph, replayLoadingOrder, safeLoadingOrder, safeLoadingOrderForPlacements,
-  safeLoadingOrderWithEvidence, safeRemovalOrder, safeRemovalOrderWithEvidence,
+  safeLoadingOrderWithEvidence, safeRemovalOrder, safeRemovalOrderWithEvidence, replayRemovalOrder,
   verifyLoadingPrefixBusinessRules, placementReachability,
 } from '../index.js';
 
@@ -262,4 +262,39 @@ test('safeRemovalOrder throws SequenceError on circular deadlock',()=>{
     ()=>safeRemovalOrder([b0,b1],container,['-z']),
     SequenceError,
   );
+});
+
+// The search before blocker counts -- restart at index 0 after every removal and test
+// each box again -- kept as the oracle the counted search must equal, as Rust keeps its own.
+function rescanningRemovalOrder(boxes,container,directions){
+  const riders=UnloadingDependencyGraph.build(boxes).dependsOn,present=new Set(boxes.map((_,index)=>index)),order=[];
+  const end=(box,axis)=>box.origin[axis]+box.dimensions[{x:'length',y:'width',z:'height'}[axis]];
+  const sweep=(box,direction)=>{const low={x:box.origin.x,y:box.origin.y,z:box.origin.z},high={x:end(box,'x'),y:end(box,'y'),z:end(box,'z')};
+    const axis=direction[1],size={x:container.length,y:container.width,z:container.height}[axis];
+    if(direction[0]==='+'){low[axis]=high[axis];high[axis]=size}else{high[axis]=low[axis];low[axis]=0}return [low,high]};
+  const hits=([low,high],other)=>['x','y','z'].every(axis=>low[axis]<end(other,axis)&&other.origin[axis]<high[axis]);
+  const clear=index=>directions.some(direction=>{const swept=sweep(boxes[index],direction);
+    return [...present].every(other=>other===index||!hits(swept,boxes[other]))});
+  while(present.size){let chosen=null;
+    for(let index=0;index<boxes.length;index++)if(present.has(index)&&riders[index].every(rider=>!present.has(rider))&&clear(index)){chosen=index;break}
+    if(chosen==null)return ['stuck',[...present].sort((a,b)=>a-b)];order.push(chosen);present.delete(chosen)}
+  try{replayRemovalOrder(boxes,container,order,directions)}catch(error){return ['replay',error.message]}
+  return order}
+function countedRemovalOrder(boxes,container,directions){
+  try{return safeRemovalOrder(boxes,container,directions)}catch(error){
+    if(error instanceof SequenceError)return ['stuck',[...error.stuck].sort((a,b)=>a-b)];
+    if(error instanceof SequenceReplayError)return ['replay',error.message];throw error}}
+
+test('the counted removal search answers what rescanning would on mixed scenes',()=>{
+  let state=0x2545f491;const next=bound=>{state=(Math.imul(state,1103515245)+12345)>>>0;return (state>>>16)%bound};
+  const directionSets=[['+x'],['+x','+y'],['-z','+x'],['+x','-x','+y','-y','+z','-z'],[]],container={length:60,width:50,height:40};
+  for(let round=0;round<400;round++){
+    const boxes=Array.from({length:1+next(14)},()=>box(next(5)*10,next(4)*10,next(3)*10,10*(1+next(2)),10*(1+next(2)),10));
+    const directions=directionSets[round%directionSets.length];
+    assert.deepEqual(countedRemovalOrder(boxes,container,directions),rescanningRemovalOrder(boxes,container,directions),`round ${round}`)}
+});
+
+test('a row blocked all the way back unloads nearest the door first',()=>{
+  const boxes=Array.from({length:60},(_,index)=>box(index*10,0,0,10,10,10));
+  assert.deepEqual(safeRemovalOrder(boxes,{length:600,width:10,height:10},['+x']),Array.from({length:60},(_,index)=>59-index));
 });

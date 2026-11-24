@@ -1,6 +1,6 @@
 {
   "name":"@packvium/engine",
-  "version":"1.11.0",
+  "version":"1.12.0",
   "description":"Deterministic 3D bin-packing and cartonization engine for pallets, containers, trucks and shipping cartons. Exact integer geometry, reproducible results.",
   "author":{"name":"Packvium contributors","url":"https://packvium.com"},
   "keywords":["3d-bin-packing","bin-packing","3d-packing","cartonization","container-loading","pallet-packing","truck-loading","packing-algorithm","logistics","deterministic","box-packing","load-planning"],

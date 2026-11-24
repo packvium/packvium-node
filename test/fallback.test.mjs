@@ -3585,3 +3585,31 @@ test('the maximal-spaces ranking compares candidates field by field, not as a su
   assert.equal(result.containers.length, 1);
   assert.equal(result.unpacked_items.length, 0);
 });
+
+test('layer and maximal_spaces rank candidates by Rust\'s far-corner key (S-08)', () => {
+  // The placements Rust's `pack-stdin` returns for this request with each solver forced.
+  // JavaScript's own orders put the second flat panel or the upright panel elsewhere.
+  const request = {
+    units: { length: 'in' },
+    configuration: { solver_profile: 'balanced', time_limit_ms: 300000,
+      effort_budget: { max_candidates_evaluated: 1000000, max_placement_attempts: 1000000, max_search_nodes: 1000000 } },
+    items: [
+      { id: 'item3', quantity: 2, dimensions: { length: '8', width: '12', height: '2' } },
+      { id: 'item2', quantity: 1, dimensions: { length: '2', width: '8', height: '12' } },
+      { id: 'item1', quantity: 2, dimensions: { length: '2', width: '4', height: '2' } },
+    ],
+    containers: [{ id: 'box', inner_dimensions: { length: '12', width: '8', height: '8' } }],
+  };
+  const rust = {
+    layer: [['item3', 'WLH', 0, 0, 0], ['item3', 'WLH', 0, 0, 812800], ['item2', 'HWL', 0, 0, 1625600],
+      ['item1', 'WLH', 0, 0, 2438400], ['item1', 'WLH', 1625600, 0, 2438400]],
+    maximal_spaces: [['item2', 'HWL', 0, 0, 0], ['item3', 'WLH', 0, 0, 812800], ['item3', 'WLH', 0, 0, 1625600],
+      ['item1', 'WLH', 0, 0, 2438400], ['item1', 'WLH', 1625600, 0, 2438400]],
+  };
+  for (const [solver, expected] of Object.entries(rust)) {
+    const result = packFallback({ ...request, configuration: { ...request.configuration, solvers: [solver] } });
+    const placements = result.containers.flatMap(container => container.placements.map(placement =>
+      [placement.item_type, placement.orientation, ...['x', 'y', 'z'].map(axis => placement.position[axis].ticks)]));
+    assert.deepEqual(placements, expected, solver);
+  }
+});

@@ -320,29 +320,35 @@ function sweptRegion(envelope, container, direction) {
   return cuboid(x1, y1, z1, x2 - x1, y2 - y1, z2 - z1);
 }
 
-function setSome(set, predicate) {
-  for (const item of set) {
-    if (predicate(item)) return true;
-  }
-  return false;
-}
-
-function hasClearExit(item, entries, present, container, directions) {
-  return directions.some((direction) => {
+/** Check one item's exits, building counts only when a previous sweep found it blocked. */
+function hasClearExit(item, entries, present, container, directions, blocked, exits) {
+  const cached = exits.get(item);
+  if (cached !== undefined) return cached.some(([, count]) => count === 0);
+  const countAll = blocked.has(item);
+  const counts = [];
+  for (const direction of directions) {
     const region = sweptRegion(entries[item][1].envelope, container, direction);
-    return !setSome(present, (other) => other !== item && intersects(region, entries[other][1].envelope));
-  });
-}
-
-/** `min(candidates)` by item id, the first of equals. */
-function lowestId(candidates, entries) {
-  return candidates.reduce((best, candidate) => (pyCmp(entries[candidate][0], entries[best][0]) < 0 ? candidate : best));
+    let count = 0;
+    for (const other of present) {
+      if (other !== item && intersects(region, entries[other][1].envelope)) {
+        count += 1;
+        if (!countAll) break;
+      }
+    }
+    if (count === 0) return true;
+    if (countAll) counts.push([region, count]);
+  }
+  if (countAll) exits.set(item, counts);
+  else blocked.add(item);
+  return false;
 }
 
 /**
  * Items due at an earlier stop must all be removable -- unblocked from
  * above and slidable out a door (all six walls when the container names none) -- before the
- * route moves on. O(s * n^2) for `s` stops: each removal rescans the items still due.
+ * route moves on. O(n^2 * d) over the route: a due item gets at most two sweeps of the scene
+ * before its exits are counted. Each removal updates counted exits and visits the removed
+ * item's support edges once.
  */
 export function checkRouteRemovalOrder(packedId, entries, graph, container, doors, issues) {
   const stops = [];
@@ -352,21 +358,37 @@ export function checkRouteRemovalOrder(packedId, entries, graph, container, door
   if (stops.length === 0) return;
   const directions = doors.length === 0 ? EXIT_DIRECTIONS : doors;
   const present = new Set(entries.map((_, index) => index));
+  const restingAbove = graph.directAbove.map((above) => above.size);
   const distinct = Array.from(new Set(stops.map(([, stop]) => stop))).sort((a, b) => (a < b ? -1 : 1));
   for (const stop of distinct) {
-    let due = stops.filter(([index, value]) => value === stop && present.has(index)).map(([index]) => index);
+    let due = stops.filter(([, value]) => value === stop).map(([index]) => index);
+    const compareIds = (left, right) => pyCmp(entries[left][0], entries[right][0]);
+    // Python only compares removable candidates. Pre-sort when all IDs are strings.
+    const sorted = due.every((item) => typeof entries[item][0] === 'string');
+    if (sorted) due.sort(compareIds);
+    const exits = new Map();
+    const blocked = new Set();
+    const removable = (item) => restingAbove[item] === 0
+      && hasClearExit(item, entries, present, container, directions, blocked, exits);
     while (due.length > 0) {
-      const removable = due.filter((item) => !setSome(graph.directAbove[item], (above) => present.has(above))
-        && hasClearExit(item, entries, present, container, directions));
-      if (removable.length === 0) {
+      const chosen = sorted ? due.find(removable) : due.filter(removable)
+        .reduce((best, item) => best === undefined || compareIds(item, best) < 0 ? item : best, undefined);
+      if (chosen === undefined) {
         const names = sortPy(due.map((index) => entries[index][0])).map(pyRepr);
         issues.push(issue('unloading_order_violation',
           `${packedId}: stop ${stop} cannot fully unload ${list(names)} before the route moves on`));
         return;
       }
-      const chosen = lowestId(removable, entries);
       present.delete(chosen);
+      exits.delete(chosen);
+      for (const [lower] of graph.supporters[chosen]) restingAbove[lower] -= 1;
       due = due.filter((item) => item !== chosen);
+      const removed = entries[chosen][1].envelope;
+      for (const counts of exits.values()) {
+        for (const exit of counts) {
+          if (intersects(exit[0], removed)) exit[1] -= 1;
+        }
+      }
     }
   }
 }

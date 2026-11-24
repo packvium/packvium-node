@@ -11,6 +11,8 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import test from 'node:test';
+import { cuboid } from '../result-validation/geometry.js';
+import { checkRouteRemovalOrder, supportGraph } from '../result-validation/stacking.js';
 
 import {
   MalformedResult,
@@ -27,6 +29,55 @@ const REQUEST = {
 };
 
 const require = createRequire(import.meta.url);
+
+test('route removal does not rescan old support edges after each removal', () => {
+  const width = 8;
+  const side = BigInt(width);
+  const entries = Array.from({ length: 2 * width }, (_, index) => {
+    const lower = index < width;
+    const offset = BigInt(index % width);
+    const envelope = lower
+      ? cuboid(offset, 0n, 0n, 1n, side, 1n)
+      : cuboid(0n, offset, 1n, side, 1n, 1n);
+    return [`item#${index}`, { envelope, spec: { nestingHeight: null, stopIndex: lower ? 2n : 1n } }];
+  });
+  const graph = supportGraph(entries);
+  let visited = 0;
+  for (const above of graph.directAbove) {
+    const original = above[Symbol.iterator].bind(above);
+    above[Symbol.iterator] = function* () {
+      for (const index of original()) {
+        visited += 1;
+        yield index;
+      }
+    };
+  }
+  const issues = [];
+  checkRouteRemovalOrder('box#1', entries, graph, [side, side, 2n], ['+z'], issues);
+  assert.deepEqual(issues, []);
+  assert.ok(visited <= width * width, `visited ${visited} support edges`);
+});
+
+test('route removal lowers a counted exit when its blocker leaves', () => {
+  // A row facing the only door: `a` is counted blocked by `b`, and leaves only once that
+  // count drops with `b`'s removal.
+  const spec = { nestingHeight: null, stopIndex: 1n };
+  const entries = ['a', 'b', 'c'].map((id, index) => [id, { envelope: cuboid(BigInt(index), 0n, 0n, 1n, 1n, 1n), spec }]);
+  const issues = [];
+  checkRouteRemovalOrder('box#1', entries, supportGraph(entries), [3n, 1n, 1n], ['+x'], issues);
+  assert.deepEqual(issues, []);
+});
+
+test('route removal only compares malformed IDs if the items can leave together', () => {
+  const spec = { nestingHeight: null, stopIndex: 1n };
+  const entries = [
+    ['lower', { envelope: cuboid(0n, 0n, 0n, 1n, 1n, 1n), spec }],
+    [1n, { envelope: cuboid(0n, 0n, 1n, 1n, 1n, 1n), spec }],
+  ];
+  const issues = [];
+  checkRouteRemovalOrder('box#1', entries, supportGraph(entries), [1n, 1n, 2n], ['+z'], issues);
+  assert.deepEqual(issues, []);
+});
 
 /** The compiled addon when one is loadable, else `null`. */
 function loadNative() {

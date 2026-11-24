@@ -13,7 +13,10 @@
  * text. The port's own integers are `BigInt`, so no arithmetic here is bounded by 2^53.
  */
 
+import { compareCodePoints } from '../commerce-model.js';
 import { contract, shape } from './outcome.js';
+
+export { compareCodePoints };
 
 const hasOwn = Object.prototype.hasOwnProperty;
 
@@ -171,21 +174,6 @@ function compareNumbers(left, right) {
   if (left.integer !== undefined) return compareIntegerToFloat(left.integer, right.float);
   if (right.integer !== undefined) return 0 - compareIntegerToFloat(right.integer, left.float) || 0;
   return left.float < right.float ? -1 : left.float > right.float ? 1 : 0;
-}
-
-/** Strings by code point, as Python, PHP and Rust order them; UTF-16 order differs past the BMP. */
-export function compareCodePoints(left, right) {
-  if (left === right) return 0;
-  let leftIndex = 0;
-  let rightIndex = 0;
-  while (leftIndex < left.length && rightIndex < right.length) {
-    const a = left.codePointAt(leftIndex);
-    const b = right.codePointAt(rightIndex);
-    if (a !== b) return a < b ? -1 : 1;
-    leftIndex += a > 0xffff ? 2 : 1;
-    rightIndex += b > 0xffff ? 2 : 1;
-  }
-  return leftIndex === left.length ? (rightIndex === right.length ? 0 : -1) : 1;
 }
 
 /** Python `==`: numbers by value whatever their type, containers element-wise, objects by key. */

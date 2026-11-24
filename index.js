@@ -162,7 +162,7 @@ export function rebalanceWeightWith(binding, request, result, { maxMoves = 64 } 
   return rebalanceFallback(request, result, { maxMoves });
 }
 
-export const version = () => native?.version?.() ?? '1.11.0-js-fallback';
+export const version = () => native?.version?.() ?? '1.12.0-js-fallback';
 
 /**
  * The result is not a document the reference validator can judge (docs/VALIDATION-CONTRACT.md):
