@@ -4,6 +4,30 @@ What changed in `@packvium/engine` on npm, release by release. The format follow
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0]
+
+The money ceiling covers sums, one name and order for unplaced items, and two fallback fixes.
+
+### Changed
+
+- **A request whose dearest openable containers cost more than 9007199254740991 minor units in
+  all,** or whose landed top brackets bill more than that in all, is `invalid_request` /
+  `above_maximum` at `/containers`. The fallback no longer rounds such a sum.
+- **An unplaced item no finer reason explains is `no_feasible_placement`,** not
+  `search_exhausted`. `unpacked_items` is listed in request order, then by instance number.
+- **A whole JSON-number length from `1e21`** is `above_maximum`, not `wrong_type`.
+- **The fallback ranks `layer` and `maximal_spaces` candidates by Rust's far-corner key,** so
+  its answers can differ from 1.11's.
+
+### Fixed
+
+- **The fallback placed an item under the overhang of a `single` ground-contact item already on
+  one supporter,** an answer `validate` refused.
+
+### Performance
+
+- **Route-removal validation runs in O(n² · d).**
+
 ## [1.11.0]
 
 Bottom gussets and standing pouches, a certified bound for the shipping objectives, one money

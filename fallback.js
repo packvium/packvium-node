@@ -423,26 +423,28 @@ function routeStuck(placements,tmpl,clear){
   return null
 }
 // K1: the measure grammar of Python's `_fraction`, the reference: an optional sign and ASCII digits, a `.` with digits on both sides (at most 18 after it), `n/d`, or a mixed `w n/d`; nothing else.
-// The classes spell Python's whitespace by hand, because JavaScript's `\s` and `trim` differ from it.
-const PY_SPACE='\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000',ASCII_SPACE='[ \\t\\n\\r\\f\\v]';
+const ASCII_SPACE='[ \\t\\n\\r\\f\\v]',ASCII_TRIM=/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g;
 const MIXED_MEASURE=new RegExp(`^([+-]?[0-9]+)${ASCII_SPACE}+([0-9]+)${ASCII_SPACE}*/${ASCII_SPACE}*([0-9]+)$`),FRACTION_MEASURE=new RegExp(`^([+-]?[0-9]+)${ASCII_SPACE}*/${ASCII_SPACE}*([0-9]+)$`),DECIMAL_MEASURE=/^([+-]?)([0-9]+)(?:\.([0-9]+))?$/;
-const MEASURE_SUFFIX=new RegExp(`^([^\\n]+?)[${PY_SPACE}]*(inches|ticks|inch|lbs|tick|mm|cm|ft|in|mg|kg|oz|lb|g|m)$`,'i'),PY_TRIM=new RegExp(`^[${PY_SPACE}]+|[${PY_SPACE}]+$`,'g');
+const LENGTH_SUFFIX=new RegExp(`^([^\\n]+?)${ASCII_SPACE}*(inches|ticks|inch|tick|mm|cm|ft|in|m)$`,'i');
+const WEIGHT_SUFFIX=new RegExp(`^([^\\n]+?)${ASCII_SPACE}*(ticks|tick|lbs|mg|kg|oz|lb|g)$`,'i');
 function rat(s){if(typeof s==='number'&&!Number.isInteger(s))throw new RangeError('a fractional number is not a measure');
-  const text=String(s).replace(PY_TRIM,'').replace(/ /g,' '),mixed=MIXED_MEASURE.exec(text);
+  // A whole JSON number is read as its exact value: `String(1e21)` is `1e+21`, which no grammar reads.
+  if(typeof s==='number')return [BigInt(s),1n];
+  const text=String(s).replace(ASCII_TRIM,'').replace(/ /g,' '),mixed=MIXED_MEASURE.exec(text);
   if(mixed){const d=BigInt(mixed[3]),whole=BigInt(mixed[1]),magnitude=(whole<0n?-whole:whole)*d+BigInt(mixed[2]);return [text.startsWith('-')?-magnitude:magnitude,d]}
   const simple=FRACTION_MEASURE.exec(text);if(simple)return [BigInt(simple[1]),BigInt(simple[2])];
   const decimal=DECIMAL_MEASURE.exec(text);if(decimal===null)throw new RangeError(`invalid decimal or fraction: ${text}`);
   const places=decimal[3]??'';if(places.length>18)throw new RangeError('decimal has more fractional digits than a tick can distinguish');
   const scale=10n**BigInt(places.length),magnitude=BigInt(decimal[2])*scale+BigInt(places===''?'0':places);return [decimal[1]==='-'?-magnitude:magnitude,scale]}
 function round(n,d){const sg=n<0n?-1n:1n,a=n<0n?-n:n,q=a/d,r=a%d;const z=r*2n<d?q:r*2n>d?q+1n:q%2n===0n?q:q+1n;return sg*z}
-function scalar(v,def,table){let raw=v,unit=def;if(v&&typeof v==='object'){raw=v.value;unit=v.unit??def}else if(typeof v==='string'){const m=MEASURE_SUFFIX.exec(v.replace(PY_TRIM,''));if(m){raw=m[1];unit=m[2]}}const[n,d]=rat(raw),exact=round(n*BigInt(table[unit.trim().toLowerCase()]),d),ticks=table===WT?exact:Number(exact);if(ticks<0)throw new RangeError(`${table===WT?'weight':'length'} cannot be negative`);return ticks}
+function scalar(v,def,table){let raw=v,unit=def;if(v&&typeof v==='object'){raw=v.value;unit=v.unit??def}else if(typeof v==='string'){const m=(table===WT?WEIGHT_SUFFIX:LENGTH_SUFFIX).exec(v.replace(ASCII_TRIM,''));if(m){raw=m[1];unit=m[2]}}const[n,d]=rat(raw),exact=round(n*BigInt(table[unit.replace(ASCII_TRIM,'').toLowerCase()]),d),ticks=table===WT?exact:Number(exact);if(ticks<0)throw new RangeError(`${table===WT?'weight':'length'} cannot be negative`);return ticks}
 // With no `output.length_unit`, the request's own `units.length` spelt as the schema's
 // output code ("Inches" is `in`); a unit no output code names, the internal tick, gives `mm`.
 /** A length measure in `unit`, and a weight measure in grams, as exact ticks: the request
  *  parser's own reading, for a module that builds a request rather than solving one. */
 export const lengthTicks=(value,unit)=>scalar(value,unit,LEN);
 export const weightTicks=value=>scalar(value,'g',WT);
-function outputLengthUnit(unit){const multiplier=LEN[unit.trim().toLowerCase()];return ['mm','cm','m','in','ft'].find(code=>LEN[code]===multiplier)??'mm'}
+function outputLengthUnit(unit){const multiplier=LEN[unit.replace(ASCII_TRIM,'').toLowerCase()];return ['mm','cm','m','in','ft'].find(code=>LEN[code]===multiplier)??'mm'}
 function dims(v,u){return [scalar(v.length,u,LEN),scalar(v.width,u,LEN),scalar(v.height,u,LEN)]}
 /**
  * The ticks of every measure one request spells, parsed once. The request check parses
@@ -1803,12 +1805,12 @@ function compareFarCorner(a,b){const ae=a.ed,be=b.ed;
   return (a.z+ae[2])-(b.z+be[2])||(a.y+ae[1])-(b.y+be[1])||(a.x+ae[0])-(b.x+be[0])
     ||a.z-b.z||a.y-b.y||a.x-b.x
     ||(a.item.shapeType==='convex_hull'?ROT_INDEX[a.r]-ROT_INDEX[b.r]:0)}
-// S-08: the order each solver alias ranks candidates by, field by field. These were weighted sums
-// (`z*1e12+y*1e6+x` and the like) that pass 2^53 at realistic sizes, so sub-ulp steps collapsed to
-// ties and a term outweighed the next one. Each is the lexicographic reading of the sum it replaces.
+// S-08: `layer` and `maximal_spaces` rank by the far corner above, as Rust's do; their own
+// orders (z2 then origin; z2 then x2+y2) agreed with Rust on 420 and 299 of 489 forced-solver
+// fixtures, against 466 and 406 with Rust's key, and no default run changed. The grid sweep keeps
+// its origin-first order: Rust's `grid` is a lattice solver, so there is no Rust key to follow.
+// Compared field by field: the weighted sums these replaced passed 2^53 at realistic sizes.
 const compareOriginFirst=(a,b)=>a.z-b.z||a.y-b.y||a.x-b.x;
-const compareLayered=(a,b)=>(a.z+a.ed[2])-(b.z+b.ed[2])||a.z-b.z||a.y-b.y||a.x-b.x;
-const compareMaximalSpaces=(a,b)=>(a.z+a.ed[2])-(b.z+b.ed[2])||(a.x+a.ed[0]+a.y+a.ed[1])-(b.x+b.ed[0]+b.y+b.ed[1]);
 // A multi-drop sweep ranks x first, so what leaves last stands deepest.
 const compareRouteFirst=(a,b)=>(a.x+a.ed[0])-(b.x+b.ed[0])||(a.y+a.ed[1])-(b.y+b.ed[1])||(a.z+a.ed[2])-(b.z+b.ed[2]);
 // Keep only the requested prefix: the root is the worst score, latest tie first.
@@ -2869,7 +2871,21 @@ export function packFallback(req,clock=monotonicNow,solverAlias=null,startIndex=
   stateOptimality(result,bound);
   reportDuration(result,Math.max(0,Math.floor(clock()-started)));
   echoCurrency(result,req.currency);
+  sortUnpackedInRequestOrder(result,req.items);
   return result;
+}
+// `unpacked_items` in the order the request listed the items, each item's
+// instances by number -- the order every engine reports, whichever search left the items
+// out and in whichever order it gave up on them. The answer and every alternative.
+// O(n + u log u) per answer.
+function sortUnpackedInRequestOrder(result,items){
+  const order=new Map(items.map((item,index)=>[item.id,index]));
+  const key=entry=>[order.get(entry.item_type),Number(entry.item_id.slice(entry.item_type.length+1))];
+  for(const answer of [result,...(result.alternatives??[])]){
+    const keyed=answer.unpacked_items.map(entry=>({entry,key:key(entry)}));
+    keyed.sort((a,b)=>a.key[0]-b.key[0]||a.key[1]-b.key[1]);
+    answer.unpacked_items=keyed.map(({entry})=>entry);
+  }
 }
 // A declared currency is echoed by the answer and by every alternative, right after
 // `catalog_versions_used` as every engine orders it; it never reaches a solver or a score.
@@ -3401,8 +3417,8 @@ const sweepCandidates=(tmpl,item,state,candidates,index,used,width,supportRatioP
   // scorer sum and the far-corner order decides alone.
   // The grid stands down for a pallet as the reference's does, to the extreme-point order.
   const alias=solverAlias==='grid'&&tmpl.deck!=null?'extreme_points':solverAlias;
-  const farCornerRanked=alias!=='grid'&&alias!=='layer'&&alias!=='maximal_spaces'&&!routeSensitive;
-  const tieBreak=farCornerRanked?compareFarCorner:alias==='grid'?compareOriginFirst:alias==='layer'?compareLayered:alias==='maximal_spaces'?compareMaximalSpaces:compareRouteFirst;
+  const farCornerRanked=alias!=='grid'&&!routeSensitive;
+  const tieBreak=farCornerRanked?compareFarCorner:alias==='grid'?compareOriginFirst:compareRouteFirst;
   // Everything that is a function of (item, rotation) alone -- the rotated envelope, the
   // volume it occupies, its hull -- is computed once per sweep here rather than once per
   // point, the class of waste docs/PERFORMANCE-PRACTICE.md ranks first. The volume gate is
@@ -4122,7 +4138,9 @@ const unpacked=remaining.map(i=>{
   // whatever a policy says, and naming the policy first would send a caller to change the
   // wrong thing.
   const cited=policyRules.length?provesUnplaceable(policyRules,i.tags,templates):null;
-  const reason=!fitsAnyRotation?'no_compatible_container_dimensions':!dimensionFit?'rotation_restricted':!weightFit?'payload_exceeded':!eligibleFit?'no_eligible_container':cited!==null?'policy_rule':timeLimitReached?'time_limit':effortStopped?'effort_limit':i.group!==null?'group_cannot_fit_together':supportIsTheBlocker(i)?'insufficient_support':limitReason(i,templates,openedByType,maxContainers,clear)??'search_exhausted',details=reason==='policy_rule'?[cited]:[];
+  // What no finer diagnosis explains is `no_feasible_placement`, the reference's name,
+  // in every engine (the owner's decision of 2026-11-21; had let each keep its own).
+  const reason=!fitsAnyRotation?'no_compatible_container_dimensions':!dimensionFit?'rotation_restricted':!weightFit?'payload_exceeded':!eligibleFit?'no_eligible_container':cited!==null?'policy_rule':timeLimitReached?'time_limit':effortStopped?'effort_limit':i.group!==null?'group_cannot_fit_together':supportIsTheBlocker(i)?'insufficient_support':limitReason(i,templates,openedByType,maxContainers,clear)??'no_feasible_placement',details=reason==='policy_rule'?[cited]:[];
   return {item_id:i.id,item_type:i.raw.id,reason,details,proof:proofForReason(reason,details)}
 });
 // Canonical objective vector — see docs/OBJECTIVE.md. Five lexicographic keys,
@@ -4460,8 +4478,29 @@ function replayLoadingNormalized(boxes,container,order,directions){validatePermu
   order.forEach((index,step)=>{validateSequenceBox(index,step,boxes,present,container);if(dependencies[index].some(dependency=>!present.has(dependency)))throw new SequenceReplayError(index,step,'a supporter has not been loaded yet');if(clearDirection(index,boxes,present,container,directions)==null)throw new SequenceReplayError(index,step,'no allowed direction is clear of what has already been loaded');present.add(index)})}
 export function replayRemovalOrder(boxes,container,order,directions=ALL_DIRECTIONS){validateDirections(directions);const [normalized,dimensions]=sequenceInputs(boxes,container);replayRemovalNormalized(normalized,dimensions,order,directions)}
 export function replayLoadingOrder(boxes,container,order,directions=ALL_DIRECTIONS){validateDirections(directions);const [normalized,dimensions]=sequenceInputs(boxes,container);replayLoadingNormalized(normalized,dimensions,order,directions)}
-export function safeRemovalOrder(boxes,container,directions=ALL_DIRECTIONS){validateDirections(directions);const [normalized,dimensions]=sequenceInputs(boxes,container),dependencies=unloadingDependencies(normalized),present=new Set(normalized.map((_,index)=>index)),order=[];
-  while(present.size){let chosen=null;for(let i=0;i<normalized.length;i++){if(present.has(i)&&dependencies[i].every(dependency=>!present.has(dependency))&&clearDirection(i,normalized,present,dimensions,directions)!=null){chosen=i;break}}if(chosen==null)throw new SequenceError(present);order.push(chosen);present.delete(chosen)}
+// (A-08), as Rust's `RemovalSearch`: answers exactly what a rescan from index 0 after
+// every removal would, but a box found blocked a second time gets per-direction blocker counts
+// that each removal lowers, so it is never tested against the whole scene again; a box found
+// removable is removed at once, so no state records that. Worst case O(n^2 * d): each box is scanned
+// once with early exit, counted once in O(n * d), then costs O(d) per removal -- not O(n^3 * d).
+const UNTESTED=0,BLOCKED=1;
+function sweepHits([x1,y1,z1,x2,y2,z2],other){return x1<other.x+other.d.length&&other.x<x2&&y1<other.y+other.d.width&&other.y<y2&&z1<other.z+other.d.height&&other.z<z2}
+function removalSearch(boxes,container,directions,dependencies){
+  const present=new Set(boxes.map((_,index)=>index)),restingOnTop=dependencies.map(riders=>riders.length),supporters=boxes.map(()=>[]),exits=boxes.map(()=>UNTESTED);
+  dependencies.forEach((riders,lower)=>{for(const rider of riders)supporters[rider].push(lower)});
+  const countBlockers=index=>directions.map(direction=>{const sweep=sweptVolume(boxes[index],container,direction);let blockers=0;
+    for(const other of present)if(other!==index&&sweepHits(sweep,boxes[other]))blockers++;return [sweep,blockers]});
+  const removable=index=>{if(restingOnTop[index])return false;let state=exits[index];
+    if(state===UNTESTED){exits[index]=BLOCKED;return clearDirection(index,boxes,present,container,directions)!=null}
+    if(state===BLOCKED)state=countBlockers(index);
+    exits[index]=state;return state.some(([,blockers])=>blockers===0)};
+  return {present,
+    next(){for(let index=0;index<boxes.length;index++)if(present.has(index)&&removable(index))return index;return null},
+    remove(removed){present.delete(removed);const box=boxes[removed];
+      for(const state of exits)if(Array.isArray(state))for(const exit of state)if(sweepHits(exit[0],box))exit[1]--;
+      for(const lower of supporters[removed])restingOnTop[lower]--;supporters[removed]=[]}}}
+export function safeRemovalOrder(boxes,container,directions=ALL_DIRECTIONS){validateDirections(directions);const [normalized,dimensions]=sequenceInputs(boxes,container),search=removalSearch(normalized,dimensions,directions,unloadingDependencies(normalized)),order=[];
+  while(search.present.size){const chosen=search.next();if(chosen==null)throw new SequenceError(search.present);order.push(chosen);search.remove(chosen)}
   replayRemovalNormalized(normalized,dimensions,order,directions);return order}
 export function safeLoadingOrder(boxes,container,directions=ALL_DIRECTIONS){const order=safeRemovalOrder(boxes,container,directions).reverse();const [normalized,dimensions]=sequenceInputs(boxes,container);replayLoadingNormalized(normalized,dimensions,order,directions);return order}
 export function safeLoadingOrderForPlacements(placements,container,directions=ALL_DIRECTIONS){const dimensions=container.dimensions??container;const order=safeLoadingOrder(placements,dimensions,directions);verifyLoadingPrefixBusinessRules(placements,order,container);return order}

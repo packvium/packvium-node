@@ -384,8 +384,10 @@ test('a rate table prices its top bracket at most 9007199254740991 with the fuel
   assertRefused(table((t) => { t.prices_minor = [100, '9007199254740991']; t.fuel_surcharge_permille = 1000; }),
     'wrong_type', '/containers/0/rate_table/prices_minor/1', 'must be an integer');
   // Landed at or inside the ceiling is answered, including a base x permille product that passes 2^53.
+  // One box can open, so only the per-container ceiling applies, not the summed one.
   for (const [price, permille] of [[9007199254740991, 0], [9007199254740991, null], [4503599627370495, 1000], [9000000000000000, 0], [10000000000000, 1000]]) {
     const request = base();
+    request.containers[0].quantity = 1;
     table((t) => { t.prices_minor = [100, price]; if (permille !== null) t.fuel_surcharge_permille = permille; })(request);
     assert.ok(packFallback(request).containers.length > 0);
   }

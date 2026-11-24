@@ -295,7 +295,8 @@ function requireTotalWeight(items, containers, weights) {
   }
 }
 
-const knownUnit = (unit, kind) => typeof unit === 'string' && hasOwn(kind.units, unit.trim().toLowerCase());
+const ASCII_TRIM = /^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g;
+const knownUnit = (unit, kind) => typeof unit === 'string' && hasOwn(kind.units, unit.replace(ASCII_TRIM, '').toLowerCase());
 
 // ------------------------------------------------------------------------------ the rules
 
@@ -339,6 +340,40 @@ export function checkRequest(data, measures) {
   containers.forEach((raw, index) => checkContainer(raw, pointer('containers', index), length, weight, lengthTicks, currency));
   requireUniqueIds(containers, 'containers');
   requireTotalWeight(items, containers, measures.weight);
+  requireTotalMoney(items, containers, lengthTicks);
+}
+
+/**
+ * M3: the most money the containers `items` can open could sum to in a packing score, against
+ * `MAX_EXACT_MAGNITUDE` -- container cost first, then the landed charge. An opened container
+ * holds at least one item, so at most `itemCount` open; the dearest types fill that count first,
+ * up to their quantity. O(c log c) for c containers.
+ */
+function requireTotalMoney(items, containers, lengthTicks) {
+  const itemCount = items.reduce((sum, item) => sum + BigInt(item.quantity ?? 1), 0n);
+  const stock = containers.map((container) => {
+    const fee = container.cost_minor ?? 0;
+    const cost = container.made_to_measure == null ? BigInt(fee)
+      : boxCost(container.made_to_measure.cost_per_square_metre_minor ?? 0, fee,
+        SIDES.map((side) => lengthTicks(container.inner_dimensions[side])));
+    const landed = container.rate_table == null ? 0n : landedTopBracket(container.rate_table);
+    const quantity = container.quantity == null ? null : BigInt(container.quantity);
+    return { quantity, cost, landed };
+  });
+  for (const [key, message] of [['cost', 'must cost'], ['landed', 'must bill']]) {
+    let remaining = itemCount, total = 0n;
+    const ordered = stock.slice().sort((left, right) => (right[key] > left[key] ? 1 : right[key] < left[key] ? -1 : 0));
+    for (const entry of ordered) {
+      if (remaining === 0n) break;
+      const opened = entry.quantity == null || entry.quantity > remaining ? remaining : entry.quantity;
+      total += opened * entry[key];
+      remaining -= opened;
+    }
+    if (total > BigInt(MAX_EXACT_MAGNITUDE)) {
+      throw new InvalidRequestError('above_maximum', '/containers',
+        `${message} at most ${MAX_EXACT_MAGNITUDE} minor units in all across the containers the items can open`);
+    }
+  }
 }
 
 function checkUnits(raw, lengths) {

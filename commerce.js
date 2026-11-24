@@ -184,10 +184,16 @@ function parseTariff(value, path, [carrierId, serviceId], number) {
   const zonesPath = `${path}.cost_per_dimensional_kg_minor`;
   const costPerDimensionalKgMinor = Object.create(null);
   const zones = asObject(fields.cost_per_dimensional_kg_minor, zonesPath);
-  // K2: ascending code-point order, so the first error never depends on where a language puts integer-like keys.
-  for (const [zone, cost] of Object.entries(zones).sort(([left], [right]) => compareCodePoints(left, right))) {
-    costPerDimensionalKgMinor[zone] = nonNegative(
-      asInteger(cost, `${zonesPath}[${zone}]`), zonesPath,
+  // K2: ascending code-point order, checking every entry's integer type before any negative-value
+  // check, so the first error matches Python and PHP (which validate types in the loader before
+  // Tariff's model invariant checks for negative entries).
+  const orderedZones = Object.entries(zones).sort(([left], [right]) => compareCodePoints(left, right));
+  for (const [zone, cost] of orderedZones) {
+    costPerDimensionalKgMinor[zone] = asInteger(cost, `${zonesPath}[${zone}]`);
+  }
+  for (const [zone] of orderedZones) {
+    nonNegative(
+      costPerDimensionalKgMinor[zone], zonesPath,
       'cost_per_dimensional_kg_minor entries cannot be negative',
     );
   }

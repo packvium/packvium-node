@@ -297,8 +297,10 @@ test('each of the four checks fires on its own mutation', () => {
   }), ['result_fact_mismatch', 'unproven_optimality_claim']);
 });
 
+// A score past 2^53 - 1 used to reach the gap statement and have only the gap withheld.
+// refuses the worst-case summed cost at admission, so no admitted request has a gap past the ceiling.
 for (const cheapCost of [0, 1]) {
-  test(`an unrepresentable gap is withheld and rejected when forged (lower cost ${cheapCost})`, async () => {
+  test(`a cost sum past the portable ceiling is refused before any gap is stated (lower cost ${cheapCost})`, async () => {
     const { packFallback } = await import('../fallback.js');
     const request = {
       items: [{ id: 'i', quantity: 2, dimensions: { length: '10', width: '10', height: '10' } }],
@@ -307,13 +309,7 @@ for (const cheapCost of [0, 1]) {
         { id: 'big', inner_dimensions: { length: '10', width: '10', height: '10' }, cost_minor: Number.MAX_SAFE_INTEGER, max_items: 1 },
       ],
     };
-    const packed = packFallback(request);
-    assert.deepEqual(packed.optimality, { code: 'not_proven' });
-    assert.deepEqual(validateWith(null, request, packed), []);
-    const absolute = 2 * Number.MAX_SAFE_INTEGER - 2 * cheapCost;
-    packed.optimality = { code: 'not_proven', lower_bound: [0, 2, 2 * cheapCost], gap_key: 2, absolute_gap: absolute };
-    if (cheapCost) packed.optimality.relative_gap = { numerator: absolute, denominator: 2 * cheapCost };
-    assert.ok(validateWith(null, request, packed).some(issue => issue.code === 'optimality_gap_mismatch'));
+    assert.throws(() => packFallback(request), { reason: 'above_maximum', field: '/containers' });
   });
 }
 
